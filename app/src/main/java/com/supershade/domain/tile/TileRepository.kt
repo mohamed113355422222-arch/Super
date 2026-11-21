@@ -1,0 +1,444 @@
+package com.supershade.domain.tile
+
+import android.app.AlarmManager
+import android.bluetooth.BluetoothManager
+import android.content.Context
+import android.content.res.Configuration
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.location.LocationManager
+import android.net.wifi.WifiManager
+import android.nfc.NfcAdapter
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
+import android.app.NotificationManager
+import com.supershade.settings.ShadeSettings
+import com.supershade.shizuku.StatusBarGovernor
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import androidx.compose.ui.graphics.asImageBitmap
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class TileRepository(
+    private val context: Context,
+    private val governor: StatusBarGovernor,
+    private val settings: ShadeSettings? = null,
+) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val componentToId: Map<String, String> =
+        TILE_COMPONENTS.entries.associate { (id, comp) -> comp to id }
+
+    private val _tiles = MutableStateFlow<List<TileDefinition>>(
+        DEFAULT_TILES.map { id ->
+            val canonical = canonicalTileId(id)
+            val (label, capability) = KNOWN_TILES[canonical]
+                ?: KNOWN_TILES[id]
+                ?: (humanizeTileLabel(canonical) to TileCapability.SETTINGS_INTENT)
+            TileDefinition(
+                id = canonical,
+                label = label,
+                isActive = false,
+                capability = capability,
+                componentName = TILE_COMPONENTS[canonical] ?: TILE_COMPONENTS[id],
+                settingsAction = TILE_SETTINGS_ACTIONS[canonical] ?: TILE_SETTINGS_ACTIONS[id],
+                subtitle = null,
+            )
+        }
+    )
+    val tiles: StateFlow<List<TileDefinition>> = _tiles.asStateFlow()
+
+    @Volatile private var torchEnabled = false
+
+    init {
+        // Track torch state without polling so the flashlight tile stays accurate
+        try {
+            val cm = context.getSystemService(CameraManager::class.java)
+            cm.registerTorchCallback(object : CameraManager.TorchCallback() {
+                override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+                    torchEnabled = enabled
+                    _tiles.value = _tiles.value.map { tile ->
+                        if (tile.id.lowercase().contains("flashlight")) tile.copy(isActive = enabled)
+                        else tile
+                    }
+                }
+            }, Handler(Looper.getMainLooper()))
+        } catch (e: Exception) {}
+
+        try {
+            val filter = android.content.IntentFilter().apply {
+                addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
+                addAction(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED)
+                addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
+                addAction(android.content.Intent.ACTION_AIRPLANE_MODE_CHANGED)
+                addAction(LocationManager.MODE_CHANGED_ACTION)
+                addAction(NfcAdapter.ACTION_ADAPTER_STATE_CHANGED)
+                addAction(android.media.AudioManager.RINGER_MODE_CHANGED_ACTION)
+                addAction("android.media.VOLUME_CHANGED_ACTION")
+                addAction(NotificationManager.ACTION_INTERRUPTION_FILTER_CHANGED)
+            }
+            val receiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: Context?, intent: android.content.Intent?) {
+                    scope.launch { updateActiveStates() }
+                }
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                context.registerReceiver(receiver, filter)
+            }
+        } catch (e: Exception) {}
+
+        try {
+            context.contentResolver.registerContentObserver(
+                Settings.System.getUriFor(Settings.System.ACCELEROMETER_ROTATION),
+                false,
+                object : android.database.ContentObserver(Handler(Looper.getMainLooper())) {
+                    override fun onChange(selfChange: Boolean) {
+                        scope.launch { updateActiveStates() }
+                    }
+                }
+            )
+        } catch (e: Exception) {}
+
+        scope.launch { loadTiles() }
+
+        settings?.enabledTiles
+            ?.onEach { loadTiles() }
+            ?.launchIn(scope)
+
+        governor.isCommanderConnected
+            .onEach { connected -> if (connected) loadTiles() }
+            .launchIn(scope)
+    }
+
+    /** Public reload entry-point — callers can trigger a fresh fetch. */
+    fun reload() {
+        scope.launch { loadTiles() }
+    }
+
+    fun setTileActiveOptimistic(id: String, active: Boolean) {
+        _tiles.value = _tiles.value.map { tile ->
+            if (tile.id == id) tile.copy(isActive = active) else tile
+        }
+    }
+
+    fun refreshActiveStates() {
+        scope.launch { updateActiveStates() }
+    }
+
+    private fun updateActiveStates() {
+        _tiles.value = _tiles.value.map { tile ->
+            tile.copy(
+                isActive = queryTileActiveState(tile.id),
+                subtitle = queryTileSubtitle(tile.id),
+            )
+        }
+    }
+
+    private suspend fun loadTiles() {
+        val userConfigured = try { settings?.enabledTiles?.first() ?: emptyList() } catch (_: Exception) { emptyList() }
+        val tokens = if (userConfigured.isNotEmpty()) {
+            userConfigured
+        } else {
+            val raw = governor.getCurrentTiles()
+            if (raw.isNotBlank()) raw.split(",").map { it.trim() }
+            else DEFAULT_TILES
+        }
+
+        _tiles.value = tokens.map { token ->
+            val id = componentToId[token] ?: token
+            val canonical = canonicalTileId(id)
+            val known = KNOWN_TILES[id] ?: KNOWN_TILES[canonical]
+            val componentName = when {
+                TILE_COMPONENTS.containsKey(id) -> TILE_COMPONENTS[id]
+                TILE_COMPONENTS.containsKey(canonical) -> TILE_COMPONENTS[canonical]
+                token.startsWith("custom(") && token.endsWith(")") -> token.substring(7, token.length - 1).trim()
+                token.contains("/") -> token
+                else -> null
+            }
+
+            var customIcon: androidx.compose.ui.graphics.ImageBitmap? = null
+            // Load real app/service icon if componentName is available
+            if (componentName != null) {
+                try {
+                    val cn = android.content.ComponentName.unflattenFromString(componentName)
+                    if (cn != null) {
+                        val pm = context.packageManager
+                        val serviceInfo = pm.getServiceInfo(cn, 0)
+                        val iconDrawable = serviceInfo.loadIcon(pm) ?: pm.getApplicationIcon(cn.packageName)
+                        customIcon = drawableToImageBitmap(iconDrawable)
+                    }
+                } catch (_: Exception) {
+                    try {
+                        val pkg = if (id.startsWith("custom(") && id.contains("/")) {
+                            id.substringAfter("custom(").substringBefore("/")
+                        } else if (id.contains("/")) id.substringBefore("/") else null
+                        if (pkg != null) {
+                            val pm = context.packageManager
+                            customIcon = drawableToImageBitmap(pm.getApplicationIcon(pkg))
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+
+            // Resolve friendly label: KNOWN_TILES -> PackageManager ServiceInfo -> humanizeTileLabel
+            val label = when {
+                known != null -> known.first
+                componentName != null -> {
+                    try {
+                        val cn = android.content.ComponentName.unflattenFromString(componentName)
+                        if (cn != null) {
+                            val pm = context.packageManager
+                            val serviceInfo = pm.getServiceInfo(cn, 0)
+                            val loaded = serviceInfo.loadLabel(pm).toString()
+                            if (loaded.isNotBlank() && !loaded.contains(".") && !loaded.endsWith("TileService") && !loaded.endsWith("Service")) {
+                                loaded
+                            } else {
+                                humanizeTileLabel(if (loaded.isNotBlank()) loaded else componentName)
+                            }
+                        } else humanizeTileLabel(id)
+                    } catch (_: Exception) {
+                        humanizeTileLabel(id)
+                    }
+                }
+                else -> humanizeTileLabel(id)
+            }
+
+            val capability = known?.second ?: TileCapability.FULL_TOGGLE
+            val isActive = queryTileActiveState(id)
+            TileDefinition(
+                id = canonical,
+                label = label,
+                isActive = isActive,
+                capability = capability,
+                componentName = componentName,
+                settingsAction = TILE_SETTINGS_ACTIONS[canonical] ?: TILE_SETTINGS_ACTIONS[id],
+                subtitle = queryTileSubtitle(canonical),
+                customIcon = customIcon,
+            )
+        }
+    }
+
+    private fun drawableToImageBitmap(drawable: android.graphics.drawable.Drawable): androidx.compose.ui.graphics.ImageBitmap? {
+        return try {
+            val d = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+                drawable is android.graphics.drawable.AdaptiveIconDrawable
+            ) {
+                drawable.foreground ?: drawable
+            } else {
+                drawable
+            }
+            val width = d.intrinsicWidth.takeIf { it > 0 } ?: 96
+            val height = d.intrinsicHeight.takeIf { it > 0 } ?: 96
+            val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bitmap)
+            d.setBounds(0, 0, canvas.width, canvas.height)
+            d.draw(canvas)
+            bitmap.asImageBitmap()
+        } catch (_: Exception) { null }
+    }
+
+    fun setTileActive(id: String, active: Boolean) {
+        val target = canonicalTileId(id)
+        _tiles.value = _tiles.value.map {
+            if (canonicalTileId(it.id) == target) it.copy(isActive = active) else it
+        }
+    }
+
+    private fun queryTileSubtitle(id: String): String? {
+        val key = canonicalTileId(id).lowercase()
+        return try {
+            when {
+                key == "wifi" || key == "internet" -> {
+                    val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                    if (wm?.isWifiEnabled != true) return null
+                    @Suppress("DEPRECATION")
+                    val raw = wm.connectionInfo?.ssid?.trim('"')
+                    if (!raw.isNullOrBlank() && raw != "<unknown ssid>") raw else "Connected"
+                }
+                key == "bt" -> {
+                    val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+                    val adapter = bm?.adapter
+                    if (adapter?.isEnabled != true) return null
+                    try {
+                        @Suppress("MissingPermission")
+                        val bonded = adapter.bondedDevices?.filter { dev ->
+                            try {
+                                val isConnectedMethod = dev.javaClass.getMethod("isConnected")
+                                (isConnectedMethod.invoke(dev) as? Boolean) == true
+                            } catch (_: Exception) { false }
+                        }
+                        val name = bonded?.firstOrNull()?.name
+                        if (!name.isNullOrBlank()) name else "On"
+                    } catch (_: Exception) { "On" }
+                }
+                key == "mute" || key == "volume" -> {
+                    val am = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                    when (am?.ringerMode) {
+                        android.media.AudioManager.RINGER_MODE_VIBRATE -> "Vibrate"
+                        android.media.AudioManager.RINGER_MODE_SILENT  -> "Mute"
+                        android.media.AudioManager.RINGER_MODE_NORMAL  -> "Sound"
+                        else -> null
+                    }
+                }
+                key == "rotation" -> {
+                    val auto = Settings.System.getInt(context.contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0) == 1
+                    if (auto) "Auto rotate" else "Portrait"
+                }
+                key == "battery" -> {
+                    val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    if (pm?.isPowerSaveMode == true) "Power saving" else null
+                }
+                key == "flashlight" -> if (torchEnabled) "On" else null
+                key == "hotspot" -> {
+                    val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                    val isAp = try {
+                        val m = wm?.javaClass?.getDeclaredMethod("isWifiApEnabled")
+                        m?.isAccessible = true
+                        (m?.invoke(wm) as? Boolean) == true
+                    } catch (_: Exception) { false }
+                    if (isAp) "Active" else null
+                }
+                key == "dnd" -> {
+                    val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                    when (nm?.currentInterruptionFilter) {
+                        NotificationManager.INTERRUPTION_FILTER_PRIORITY -> "Priority only"
+                        NotificationManager.INTERRUPTION_FILTER_ALARMS   -> "Alarms only"
+                        NotificationManager.INTERRUPTION_FILTER_NONE     -> "Silent"
+                        else -> null
+                    }
+                }
+                key == "datasaver" -> {
+                    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                    if (cm?.restrictBackgroundStatus == android.net.ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED) {
+                        "Active"
+                    } else null
+                }
+                key == "alarm" -> {
+                    val am = context.getSystemService(AlarmManager::class.java)
+                    val next = am?.nextAlarmClock
+                    if (next != null)
+                        SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(next.triggerTime))
+                    else null
+                }
+                key == "caffeinate" -> {
+                    val timeout = Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_OFF_TIMEOUT, 30000)
+                    when {
+                        timeout >= 1_800_000 -> "30m"
+                        timeout >= 600_000   -> "10m"
+                        timeout >= 300_000   -> "5m"
+                        timeout >= 120_000   -> "2m"
+                        else                 -> "30s"
+                    }
+                }
+                key == "quick_share" -> "Share nearby"
+                key == "powermenu" -> "Power"
+                key == "screenshot" -> "Capture"
+                else -> null
+            }
+        } catch (_: Exception) { null }
+    }
+
+    private fun queryTileActiveState(id: String): Boolean {
+        val key = canonicalTileId(id).lowercase()
+        return try {
+            when {
+                key == "wifi" || key == "internet" -> {
+                    val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                    wm?.isWifiEnabled == true
+                }
+                key == "bt" -> {
+                    val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+                    bm?.adapter?.isEnabled == true
+                }
+                key == "dark" -> {
+                    (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+                }
+                key == "night" -> {
+                    Settings.System.getInt(context.contentResolver, "blue_light_filter", 0) == 1 ||
+                        Settings.Secure.getInt(context.contentResolver, "night_display_activated", 0) == 1
+                }
+                key == "rotation" -> {
+                    Settings.System.getInt(context.contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0) == 1
+                }
+                key == "airplane" -> {
+                    Settings.Global.getInt(context.contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) == 1
+                }
+                key == "location" -> {
+                    val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+                    lm?.isLocationEnabled == true
+                }
+                key == "nfc" -> {
+                    val nfc = NfcAdapter.getDefaultAdapter(context)
+                    nfc?.isEnabled == true
+                }
+                key == "dnd" -> {
+                    val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                    (nm?.currentInterruptionFilter ?: NotificationManager.INTERRUPTION_FILTER_ALL) != NotificationManager.INTERRUPTION_FILTER_ALL
+                }
+                key == "battery" -> {
+                    val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    pm?.isPowerSaveMode == true
+                }
+                key == "protect_battery" -> {
+                    Settings.Global.getInt(context.contentResolver, "protect_battery", 0) == 1
+                }
+                key == "flashlight" -> torchEnabled
+                key == "cell" -> {
+                    val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as? android.telephony.TelephonyManager
+                    try { tm?.isDataEnabled == true } catch (_: Exception) { false }
+                }
+                key == "hotspot" -> {
+                    val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                    try {
+                        val m = wm?.javaClass?.getDeclaredMethod("isWifiApEnabled")
+                        m?.isAccessible = true
+                        (m?.invoke(wm) as? Boolean) == true
+                    } catch (_: Exception) { false }
+                }
+                key == "mute" -> {
+                    val am = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                    am?.ringerMode == android.media.AudioManager.RINGER_MODE_NORMAL
+                }
+                key == "sync" -> android.content.ContentResolver.getMasterSyncAutomatically()
+                key == "datasaver" -> {
+                    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                    cm?.restrictBackgroundStatus == android.net.ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED
+                }
+                key == "extra_dim" -> {
+                    Settings.Secure.getInt(context.contentResolver, "reduce_bright_colors_activated", 0) == 1
+                }
+                key == "aod" -> {
+                    Settings.Secure.getInt(context.contentResolver, "aod_mode", 0) == 1 ||
+                        Settings.Secure.getInt(context.contentResolver, "doze_always_on", 0) == 1
+                }
+                key == "alarm" -> {
+                    val am = context.getSystemService(AlarmManager::class.java)
+                    am?.nextAlarmClock != null
+                }
+                key == "onehanded" -> {
+                    Settings.Secure.getInt(context.contentResolver, "one_handed_mode_enabled", 0) == 1
+                }
+                key == "caffeinate" -> {
+                    val timeout = Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_OFF_TIMEOUT, 30000)
+                    timeout > 30000
+                }
+                else -> false
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+}

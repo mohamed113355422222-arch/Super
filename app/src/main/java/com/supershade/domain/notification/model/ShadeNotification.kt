@@ -1,0 +1,145 @@
+package com.supershade.domain.notification.model
+
+import android.app.Notification
+import android.app.RemoteInput
+import android.graphics.drawable.Icon
+import android.service.notification.StatusBarNotification
+
+data class ShadeNotification(
+    val key: String,
+    val packageName: String,
+    val title: String,
+    val text: String,
+    val subText: String?,
+    val category: ShadeCategory,
+    val smallIcon: Icon?,
+    val largeIcon: Icon? = null,
+    val isGroupSummary: Boolean,
+    val groupKey: String?,
+    val postTime: Long,
+    val actions: List<NotificationAction>,
+    val isClearable: Boolean,
+    val contentIntent: android.app.PendingIntent? = null,
+    val isConversation: Boolean = false,
+    val conversationTitle: String? = null,
+    val progress: Int = 0,
+    val progressMax: Int = 0,
+    val isProgressIndeterminate: Boolean = false,
+    val picture: android.graphics.Bitmap? = null,
+    val channelId: String? = null,
+    val isOngoing: Boolean = false,
+    val otpCode: String? = null,
+    val isVipAlert: Boolean = false,
+    val isSilent: Boolean = false,
+)
+
+data class NotificationAction(
+    val label: String,
+    val pendingIntent: android.app.PendingIntent?,
+    val replyInput: android.app.RemoteInput? = null,
+)
+
+fun StatusBarNotification.toShadeNotification(
+    category: ShadeCategory,
+    rankingMap: android.service.notification.NotificationListenerService.RankingMap? = null,
+): ShadeNotification {
+    val extras = notification.extras
+    val rawTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+        ?: extras.getCharSequence(Notification.EXTRA_TITLE_BIG)?.toString()
+        ?: notification.tickerText?.toString()
+        ?: ""
+
+    val rawText = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+        ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
+        ?: extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.joinToString("\n")
+        ?: extras.getCharSequence(Notification.EXTRA_SUMMARY_TEXT)?.toString()
+        ?: extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
+        ?: ""
+
+    val rawSubText = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
+        ?: extras.getCharSequence(Notification.EXTRA_INFO_TEXT)?.toString()
+
+    val conversationTitle = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()
+    val progress = extras.getInt(Notification.EXTRA_PROGRESS, 0)
+    val progressMax = extras.getInt(Notification.EXTRA_PROGRESS_MAX, 0)
+    val isProgressIndeterminate = extras.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false)
+
+    // BigPictureStyle image — scale down to cap memory at ~512px wide
+    val rawPicture = (extras.get(Notification.EXTRA_PICTURE) as? android.graphics.Bitmap)
+        ?: (extras.get(Notification.EXTRA_PICTURE_ICON) as? android.graphics.Bitmap)
+    val picture = rawPicture?.let { bmp ->
+        val maxW = 512
+        if (bmp.width > maxW) {
+            val scale = maxW.toFloat() / bmp.width
+            android.graphics.Bitmap.createScaledBitmap(
+                bmp, maxW, (bmp.height * scale).toInt(), true
+            )
+        } else bmp
+    }
+
+    val isMessaging = notification.category == Notification.CATEGORY_MESSAGE ||
+        extras.containsKey(Notification.EXTRA_MESSAGING_PERSON) ||
+        extras.containsKey(Notification.EXTRA_MESSAGES) ||
+        !conversationTitle.isNullOrBlank()
+
+    val isSilent = computeIsSilentNotification(this, rankingMap)
+
+    return ShadeNotification(
+        key = key,
+        packageName = packageName,
+        title = rawTitle.trim(),
+        text = rawText.trim(),
+        subText = rawSubText?.trim(),
+        category = category,
+        smallIcon = notification.smallIcon,
+        largeIcon = notification.getLargeIcon(),
+        isGroupSummary = notification.flags and Notification.FLAG_GROUP_SUMMARY != 0,
+        groupKey = notification.group,
+        postTime = postTime,
+        actions = notification.actions?.mapNotNull { action ->
+            val title = action.title?.toString()?.trim()
+            if (!title.isNullOrBlank()) NotificationAction(
+                label = title,
+                pendingIntent = action.actionIntent,
+                replyInput = action.remoteInputs?.firstOrNull(),
+            ) else null
+        } ?: emptyList(),
+        isClearable = isClearable,
+        contentIntent = notification.contentIntent,
+        isConversation = isMessaging,
+        conversationTitle = conversationTitle?.trim(),
+        progress = progress,
+        progressMax = progressMax,
+        isProgressIndeterminate = isProgressIndeterminate,
+        picture = picture,
+        channelId = notification.channelId,
+        isOngoing = (notification.flags and Notification.FLAG_ONGOING_EVENT != 0) || !isClearable,
+        otpCode = com.supershade.domain.notification.OtpDetector.extractOtp(rawTitle, rawText, rawSubText),
+        isVipAlert = com.supershade.domain.notification.OtpDetector.isVipAlert(rawTitle, rawText, rawSubText),
+        isSilent = isSilent,
+    )
+}
+
+private fun computeIsSilentNotification(
+    sbn: StatusBarNotification,
+    rankingMap: android.service.notification.NotificationListenerService.RankingMap?,
+): Boolean {
+    if (rankingMap != null) {
+        val ranking = android.service.notification.NotificationListenerService.Ranking()
+        if (rankingMap.getRanking(sbn.key, ranking)) {
+            val imp = ranking.importance
+            if (imp != android.app.NotificationManager.IMPORTANCE_UNSPECIFIED) {
+                return imp <= android.app.NotificationManager.IMPORTANCE_LOW
+            }
+            val chImp = ranking.channel?.importance
+            if (chImp != null && chImp != android.app.NotificationManager.IMPORTANCE_UNSPECIFIED) {
+                return chImp <= android.app.NotificationManager.IMPORTANCE_LOW
+            }
+        }
+    }
+    @Suppress("DEPRECATION")
+    val legacyPriority = sbn.notification.priority
+    if (legacyPriority < Notification.PRIORITY_DEFAULT) return true
+    val chId = sbn.notification.channelId.orEmpty()
+    return chId.contains("silent", ignoreCase = true) || chId.contains("low", ignoreCase = true)
+}
