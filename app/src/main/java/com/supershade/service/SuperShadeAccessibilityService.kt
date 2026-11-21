@@ -46,6 +46,10 @@ class SuperShadeAccessibilityService : AccessibilityService() {
         var instance: SuperShadeAccessibilityService? = null
             private set
 
+        @Volatile
+        var isTouchCaptureAttached: Boolean = false
+            private set
+
         fun isRunning(): Boolean = instance != null
     }
 
@@ -72,27 +76,28 @@ class SuperShadeAccessibilityService : AccessibilityService() {
         instance = this
         android.util.Log.i("SuperShadeA11y", "onServiceConnected: initializing settings observer")
 
-        // Observe isOpen state from ViewModel so opening shade from gesture or system intercept
-        // immediately presents the overlay window.
+        // Failover observer when ShadeService is not currently running (e.g. killed by low-RAM trim).
         shadeViewModel.state
             .map { it.isOpen }
             .distinctUntilChanged()
             .onEach { isOpen ->
-                customStatusBarOverlay.setSuppressedForShade(isOpen)
-                if (isOpen) {
-                    if (!shadeViewModel.isGestureDragging.value) {
-                        shadeWindowManager.show()
+                if (!ShadeService.isServiceRunning) {
+                    customStatusBarOverlay.setSuppressedForShade(isOpen)
+                    if (isOpen) {
+                        if (!shadeViewModel.isGestureDragging.value) {
+                            shadeWindowManager.show()
+                        }
+                    } else {
+                        shadeWindowManager.hideImmediate()
                     }
-                } else {
-                    shadeWindowManager.hideImmediate()
                 }
             }
             .launchIn(scope)
 
-        // Show peek cards for incoming notifications when shade is closed.
+        // Failover peek cards when ShadeService is not currently running.
         notificationRepo.newNotifications
             .onEach { notification ->
-                if (!shadeViewModel.state.value.isOpen) {
+                if (!ShadeService.isServiceRunning && !shadeViewModel.state.value.isOpen) {
                     headsUpOverlay.show(notification)
                 }
             }
@@ -109,13 +114,17 @@ class SuperShadeAccessibilityService : AccessibilityService() {
             .onEach { (active, block, customBar) ->
                 isSuperShadeActive = active
                 if (active) {
+                    shadeWindowManager.prewarm()
                     attachAccessibilityTouchCapture()
+                    governor.updateTouchCaptureAvailability(isTouchCaptureAttached || ShadeService.isServiceRunning)
                     governor.applyStatusBarPolicy(
                         disableExpansion = block,
                         hideSystemStatusBar = customBar,
                     )
+                    ensureShadeServiceRunning()
                 } else {
                     detachAccessibilityTouchCapture()
+                    governor.updateTouchCaptureAvailability(false)
                     customStatusBarOverlay.detach()
                     governor.restoreSystemStatusBar()
                 }
@@ -130,9 +139,23 @@ class SuperShadeAccessibilityService : AccessibilityService() {
             .launchIn(scope)
     }
 
+    private fun ensureShadeServiceRunning() {
+        if (ShadeService.isServiceRunning) return
+        if (!android.provider.Settings.canDrawOverlays(this)) return
+        val intent = Intent(this, ShadeService::class.java)
+        try {
+            startForegroundService(intent)
+        } catch (_: Exception) {
+            try { startService(intent) } catch (_: Exception) {}
+        }
+    }
 
     private fun attachAccessibilityTouchCapture() {
-        if (touchCaptureView != null) return
+        if (touchCaptureView?.isAttachedToWindow == true) {
+            isTouchCaptureAttached = true
+            return
+        }
+        if (touchCaptureView != null) detachAccessibilityTouchCapture()
 
         val wm = getSystemService(WindowManager::class.java) ?: return
         windowManager = wm
@@ -159,7 +182,8 @@ class SuperShadeAccessibilityService : AccessibilityService() {
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -179,7 +203,11 @@ class SuperShadeAccessibilityService : AccessibilityService() {
 
         val helper = com.supershade.overlay.TopSwipeGestureHelper(
             context = this,
-            isShadeOpen = { shadeViewModel.state.value.isOpen },
+            isShadeOpen = {
+                shadeViewModel.state.value.isOpen &&
+                    !shadeViewModel.isClosing.value &&
+                    shadeWindowManager.isShowing()
+            },
             splitGestureMode = { currentSplitGestureMode },
             onBeginSwipeOpen = { expandQs ->
                 scope.launch { governor.collapse() }
@@ -200,22 +228,27 @@ class SuperShadeAccessibilityService : AccessibilityService() {
                 }
             },
         )
-        topSwipeHelper = helper
 
         val view = View(this).apply {
             setOnTouchListener(helper.createTouchListener())
         }
 
-        touchCaptureView = view
         try {
             wm.addView(view, params)
+            topSwipeHelper = helper
+            touchCaptureView = view
+            isTouchCaptureAttached = true
             android.util.Log.i("SuperShadeA11y", "TYPE_ACCESSIBILITY_OVERLAY touch window added successfully at height $statusBarHeightPx px")
         } catch (e: Exception) {
+            isTouchCaptureAttached = false
+            topSwipeHelper = null
+            touchCaptureView = null
             android.util.Log.e("SuperShadeA11y", "Failed to add TYPE_ACCESSIBILITY_OVERLAY window", e)
         }
     }
 
     private fun detachAccessibilityTouchCapture() {
+        isTouchCaptureAttached = false
         topSwipeHelper?.cancelActiveTracking()
         topSwipeHelper = null
         touchCaptureView?.let { view ->
@@ -230,15 +263,27 @@ class SuperShadeAccessibilityService : AccessibilityService() {
         touchCaptureView = null
     }
 
+    @Volatile private var lastServiceCheckMs = 0L
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!isSuperShadeActive || event == null) return
 
+        if (!ShadeService.isServiceRunning || !isTouchCaptureAttached) {
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastServiceCheckMs >= 10_000L) {
+                lastServiceCheckMs = nowMs
+                if (!isTouchCaptureAttached) attachAccessibilityTouchCapture()
+                ensureShadeServiceRunning()
+            }
+        }
+
         when (event.eventType) {
             // Real system shade expansion updates the window list.
-            // Guard: require isActive + layer >= 3 to avoid false positives from transient UI.
+            // Guard: require isActive + layer >= 2 to avoid false positives from transient UI.
             // Debounce: skip re-triggers within 2 s of a previous open.
             AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
-                if (shadeViewModel.state.value.isOpen) return
+                if (shadeViewModel.isGestureDragging.value) return
+                if (shadeViewModel.state.value.isOpen && !shadeViewModel.isClosing.value) return
                 // Debounce: don't re-trigger if we just opened within 2 s
                 val now = System.currentTimeMillis()
                 if (now - lastShadeOpenTimeMs < 2000L) return
@@ -285,7 +330,7 @@ class SuperShadeAccessibilityService : AccessibilityService() {
                     cls == "com.android.systemui.shade.NotificationPanelViewController" ||
                     cls == "com.android.systemui.shade.SecNotificationPanelViewController"
 
-                if (isExactShadeController && !shadeViewModel.state.value.isOpen) {
+                if (isExactShadeController && !shadeViewModel.isGestureDragging.value && (!shadeViewModel.state.value.isOpen || shadeViewModel.isClosing.value)) {
                     android.util.Log.d("SuperShadeA11y", "Intercepted exact shade controller: $cls")
                     openSuperShade(expandQs = false)
                 }
@@ -421,8 +466,13 @@ class SuperShadeAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         detachAccessibilityTouchCapture()
-        shadeWindowManager.hide()
-        governor.restoreSystemStatusBarBlocking()
+        if (!ShadeService.isServiceRunning) {
+            governor.updateTouchCaptureAvailability(false)
+            shadeWindowManager.hide()
+            governor.restoreSystemStatusBarBlocking()
+        } else {
+            governor.updateTouchCaptureAvailability(false)
+        }
         scope.cancel()
         instance = null
     }

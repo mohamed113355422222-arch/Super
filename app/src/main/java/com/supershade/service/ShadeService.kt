@@ -19,6 +19,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
@@ -55,14 +56,16 @@ class ShadeService : Service() {
     private val customStatusBarOverlay: com.supershade.overlay.CustomStatusBarOverlay by inject()
     private val customStatusBarRepository: com.supershade.domain.system.CustomStatusBarRepository by inject()
     private val headsUpOverlay: HeadsUpOverlay by inject()
-    private val gestureOverlayLock = Any()
     private var gestureOverlay: GestureOverlay? = null
+    private var screenStateReceiver: android.content.BroadcastReceiver? = null
 
     companion object {
         const val CHANNEL_ID = "supershade_service"
         const val NOTIFICATION_ID = 1001
         const val ACTION_OPEN_SHADE = "com.supershade.action.OPEN_SHADE"
         const val EXTRA_EXPAND_QS = "expand_qs"
+        @Volatile var isServiceRunning: Boolean = false
+            private set
     }
 
     // ---------------------------------------------------------------------------
@@ -71,6 +74,7 @@ class ShadeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isServiceRunning = true
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
@@ -79,15 +83,16 @@ class ShadeService : Service() {
             .onEach { currentSplitMode = it }
             .launchIn(scope)
 
-        // Pre-warm the Compose shade window in GONE state so pulling down responds immediately
-        // without a ~500ms cold Compose inflation lag.
+        // Pre-warm the Compose shade window so pulling down responds immediately.
         windowManager.prewarm()
 
-        // Attach the gesture capture overlay. Streams continuous finger pull-down progress
-        // to ShadeViewModel & ShadeWindowManager for 1:1 Control-Center-style reveals.
         gestureOverlay = GestureOverlay(
             context = this,
-            isShadeOpen = { shadeViewModel.state.value.isOpen },
+            isShadeOpen = {
+                shadeViewModel.state.value.isOpen &&
+                    !shadeViewModel.isClosing.value &&
+                    windowManager.isShowing()
+            },
             splitGestureMode = { currentSplitMode },
             onSwipeDown = { expandQs -> shadeViewModel.open(expandQs) },
             onBeginSwipeOpen = { expandQs ->
@@ -108,7 +113,8 @@ class ShadeService : Service() {
                 }
             },
         )
-        gestureOverlay?.attach()
+        attachGestureAndSyncPolicy()
+        registerScreenRecoveryReceiver()
 
         // Show peek cards for new notifications when the shade panel is closed.
         notificationRepo.newNotifications
@@ -204,6 +210,8 @@ class ShadeService : Service() {
             .onEach { active ->
                 if (!active) {
                     stopSelf()
+                } else {
+                    attachGestureAndSyncPolicy()
                 }
             }
             .launchIn(scope)
@@ -218,6 +226,7 @@ class ShadeService : Service() {
         }
             .distinctUntilChanged()
             .onEach { (shouldBlock, shouldHideNative) ->
+                updateTouchCaptureAvailability()
                 governor.applyStatusBarPolicy(
                     disableExpansion = shouldBlock,
                     hideSystemStatusBar = shouldHideNative,
@@ -226,7 +235,63 @@ class ShadeService : Service() {
             .launchIn(scope)
     }
 
+    private fun attachGestureAndSyncPolicy() {
+        windowManager.prewarm()
+        gestureOverlay?.attach()
+        updateTouchCaptureAvailability()
+    }
+
+    private fun updateTouchCaptureAvailability() {
+        val available = (gestureOverlay?.isAttached == true) ||
+            SuperShadeAccessibilityService.isTouchCaptureAttached
+        governor.updateTouchCaptureAvailability(available)
+    }
+
+    private fun registerScreenRecoveryReceiver() {
+        if (screenStateReceiver != null) return
+        val filter = android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: android.content.Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> {
+                        gestureOverlay?.cancelActiveTracking()
+                        if (shadeViewModel.state.value.isOpen ||
+                            shadeViewModel.isClosing.value ||
+                            windowManager.isShowing()
+                        ) {
+                            shadeViewModel.completeClose()
+                            windowManager.hideImmediate()
+                        }
+                    }
+                    else -> {
+                        // Heal any stale close/open state or detached overlay after screen sleep/low-RAM trim.
+                        if ((shadeViewModel.state.value.isOpen || shadeViewModel.isClosing.value) &&
+                            !windowManager.isShowing()
+                        ) {
+                            shadeViewModel.completeClose()
+                        }
+                        governor.bindService()
+                        attachGestureAndSyncPolicy()
+                    }
+                }
+            }
+        }
+        screenStateReceiver = receiver
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
+        } catch (_: Exception) {}
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        attachGestureAndSyncPolicy()
         if (intent?.action == ACTION_OPEN_SHADE) {
             val expandQs = intent.getBooleanExtra(EXTRA_EXPAND_QS, false)
             shadeViewModel.open(expandQs)
@@ -234,25 +299,62 @@ class ShadeService : Service() {
         return START_STICKY
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        scope.launch {
+            val active = try { settings.isActive.first() } catch (_: Exception) { false }
+            if (active && android.provider.Settings.canDrawOverlays(this@ShadeService)) {
+                attachGestureAndSyncPolicy()
+                try {
+                    val restartIntent = Intent(applicationContext, ShadeService::class.java)
+                    val pending = android.app.PendingIntent.getForegroundService(
+                        applicationContext,
+                        1002,
+                        restartIntent,
+                        android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
+                    )
+                    val alarmManager = getSystemService(android.app.AlarmManager::class.java)
+                    alarmManager?.setExactAndAllowWhileIdle(
+                        android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        android.os.SystemClock.elapsedRealtime() + 800L,
+                        pending,
+                    )
+                } catch (_: Exception) {
+                    try {
+                        startForegroundService(Intent(applicationContext, ShadeService::class.java))
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
         customStatusBarOverlay.onConfigurationChanged()
+        gestureOverlay?.detach()
+        attachGestureAndSyncPolicy()
     }
 
     override fun onDestroy() {
+        isServiceRunning = false
         super.onDestroy()
+        screenStateReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) {}
+        }
+        screenStateReceiver = null
         customStatusBarOverlay.detach()
         gestureOverlay?.detach()
         gestureOverlay = null
+        governor.updateTouchCaptureAvailability(SuperShadeAccessibilityService.isTouchCaptureAttached)
         headsUpOverlay.destroy()
         windowManager.destroy()
 
-        // Re-enable the native system status bar synchronously before unbinding service.
-        governor.restoreSystemStatusBarBlocking()
-
-        // Tear down the Shizuku UserService and clean up binder listeners.
-        governor.unbindService()
-        connector.cleanup()
+        // Re-enable the native system status bar synchronously when accessibility capture isn't active.
+        if (!SuperShadeAccessibilityService.isTouchCaptureAttached) {
+            governor.restoreSystemStatusBarBlocking()
+            governor.unbindService()
+            connector.cleanup()
+        }
         scope.cancel()
     }
 

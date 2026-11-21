@@ -48,6 +48,16 @@ class SuperShadeTileService : TileService() {
 
     override fun onStartListening() {
         super.onStartListening()
+        scope.launch {
+            try {
+                if (settings.isActive.first() &&
+                    !ShadeService.isServiceRunning &&
+                    android.provider.Settings.canDrawOverlays(this@SuperShadeTileService)
+                ) {
+                    toggleShadeService(true)
+                }
+            } catch (_: Exception) {}
+        }
         updateTileState()
     }
 

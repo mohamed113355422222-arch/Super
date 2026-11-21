@@ -51,7 +51,8 @@ class GestureOverlay(
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
         PixelFormat.TRANSLUCENT,
     ).apply {
         gravity = Gravity.TOP or Gravity.START
@@ -69,8 +70,15 @@ class GestureOverlay(
         }
     }
 
-    fun attach() {
-        if (overlayView != null) return
+    val isAttached: Boolean
+        get() = overlayView?.isAttachedToWindow == true
+
+    fun attach(): Boolean {
+        if (overlayView?.isAttachedToWindow == true) return true
+        if (overlayView != null) detach()
+        if (!android.provider.Settings.canDrawOverlays(context)) return false
+        val wm = windowManager ?: return false
+
         val helper = TopSwipeGestureHelper(
             context = context,
             isShadeOpen = isShadeOpen,
@@ -90,15 +98,25 @@ class GestureOverlay(
             },
             onBrightnessSwipe = onBrightnessSwipe,
         )
-        gestureHelper = helper
 
         val view = View(context).apply {
             setOnTouchListener(helper.createTouchListener())
         }
-        overlayView = view
-        try {
-            windowManager?.addView(view, params)
-        } catch (_: Exception) {}
+        return try {
+            wm.addView(view, params)
+            gestureHelper = helper
+            overlayView = view
+            true
+        } catch (e: Exception) {
+            android.util.Log.e("GestureOverlay", "Failed to attach top gesture overlay", e)
+            gestureHelper = null
+            overlayView = null
+            false
+        }
+    }
+
+    fun cancelActiveTracking() {
+        gestureHelper?.cancelActiveTracking()
     }
 
     fun detach() {

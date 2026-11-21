@@ -28,6 +28,7 @@ import com.supershade.domain.tile.canonicalTileId
 import com.supershade.domain.tile.humanizeTileLabel
 import com.supershade.settings.ShadeSettings
 import com.supershade.shizuku.StatusBarGovernor
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -47,6 +48,11 @@ sealed class ShadeTransitionEvent {
     data class FinishOpen(val progress: Float, val velocity: Float) : ShadeTransitionEvent()
     data class FinishClose(val progress: Float, val velocity: Float) : ShadeTransitionEvent()
 }
+
+data class PendingShadeTransition(
+    val id: Long,
+    val event: ShadeTransitionEvent,
+)
 
 class ShadeViewModel(
     private val context: Context,
@@ -74,12 +80,25 @@ class ShadeViewModel(
     private val _isGestureDragging = MutableStateFlow(false)
     val isGestureDragging: StateFlow<Boolean> = _isGestureDragging.asStateFlow()
 
+    private val _isClosing = MutableStateFlow(false)
+    val isClosing: StateFlow<Boolean> = _isClosing.asStateFlow()
+
     private val _transitionEvent = MutableSharedFlow<ShadeTransitionEvent>(extraBufferCapacity = 8)
     val transitionEvent: SharedFlow<ShadeTransitionEvent> = _transitionEvent.asSharedFlow()
 
+    private val _latestTransition = MutableStateFlow<PendingShadeTransition?>(null)
+    val latestTransition: StateFlow<PendingShadeTransition?> = _latestTransition.asStateFlow()
+
+    private var transitionSeq = 0L
     private var positionTickerJob: Job? = null
     private var brightnessJob: Job? = null
     private var connectivityRefreshJob: Job? = null
+
+    private fun emitTransition(event: ShadeTransitionEvent) {
+        _transitionEvent.tryEmit(event)
+        transitionSeq += 1L
+        _latestTransition.value = PendingShadeTransition(transitionSeq, event)
+    }
 
     init {
         tileToggler.onExternalActivityLaunched = {
@@ -313,6 +332,7 @@ class ShadeViewModel(
     }
 
     fun beginInteractiveOpen(expandQs: Boolean = false) {
+        _isClosing.value = false
         _isGestureDragging.value = true
         _gestureProgress.value = 0.025f
         _state.update {
@@ -320,12 +340,17 @@ class ShadeViewModel(
                 isOpen = true,
                 isQsExpanded = expandQs,
                 activePanel = if (expandQs) ShadePanel.QUICK_SETTINGS else ShadePanel.NOTIFICATIONS,
-                brightness = brightnessRepo.getCurrent(),
             )
         }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
+            val currentBrightness = brightnessRepo.getCurrent()
+            _state.update { it.copy(brightness = currentBrightness) }
             mediaRepo.refresh()
-            tileRepo.reload()
+            if (_state.value.tiles.isEmpty()) {
+                tileRepo.reload()
+            } else {
+                tileRepo.refreshActiveStates()
+            }
             notificationRepo.refresh()
         }
     }
@@ -341,16 +366,18 @@ class ShadeViewModel(
     ) {
         val clamped = progress.coerceIn(0f, 1.06f)
         _isGestureDragging.value = false
+        _isClosing.value = !shouldOpen
         _gestureProgress.value = clamped
         if (shouldOpen) {
-            _transitionEvent.tryEmit(ShadeTransitionEvent.FinishOpen(clamped, progressVelocity))
+            emitTransition(ShadeTransitionEvent.FinishOpen(clamped, progressVelocity))
             updatePositionTicker(_state.value.media)
         } else {
-            _transitionEvent.tryEmit(ShadeTransitionEvent.FinishClose(clamped, progressVelocity))
+            emitTransition(ShadeTransitionEvent.FinishClose(clamped, progressVelocity))
         }
     }
 
     fun open(expandQs: Boolean = false) {
+        _isClosing.value = false
         _isGestureDragging.value = false
         _gestureProgress.value = 0f
         _state.update {
@@ -358,22 +385,33 @@ class ShadeViewModel(
                 isOpen = true,
                 isQsExpanded = expandQs,
                 activePanel = if (expandQs) ShadePanel.QUICK_SETTINGS else ShadePanel.NOTIFICATIONS,
-                brightness = brightnessRepo.getCurrent(),
             )
         }
-        _transitionEvent.tryEmit(ShadeTransitionEvent.FinishOpen(0f, 0f))
-        viewModelScope.launch {
+        emitTransition(ShadeTransitionEvent.FinishOpen(0f, 0f))
+        viewModelScope.launch(Dispatchers.IO) {
+            val currentBrightness = brightnessRepo.getCurrent()
+            _state.update { it.copy(brightness = currentBrightness) }
             mediaRepo.refresh()
-            tileRepo.reload()
+            if (_state.value.tiles.isEmpty()) {
+                tileRepo.reload()
+            } else {
+                tileRepo.refreshActiveStates()
+            }
             notificationRepo.refresh()
         }
         updatePositionTicker(_state.value.media)
     }
 
+    fun beginClosing() {
+        _isGestureDragging.value = false
+        _isClosing.value = true
+    }
+
     fun requestAnimatedClose() {
         _isGestureDragging.value = false
+        _isClosing.value = true
         val startP = _gestureProgress.value.takeIf { it > 0.01f } ?: 1f
-        _transitionEvent.tryEmit(ShadeTransitionEvent.FinishClose(startP, -2.5f))
+        emitTransition(ShadeTransitionEvent.FinishClose(startP, -2.5f))
     }
 
     fun completeClose() {
@@ -401,8 +439,10 @@ class ShadeViewModel(
     fun close() {
         connectivity.stopNearbyScan()
         connectivityRefreshJob?.cancel()
+        _isClosing.value = false
         _isGestureDragging.value = false
         _gestureProgress.value = 0f
+        _latestTransition.value = null
         _state.update { it.copy(isOpen = false, isQsExpanded = false, activeTileDetail = null) }
         positionTickerJob?.cancel()
         positionTickerJob = null

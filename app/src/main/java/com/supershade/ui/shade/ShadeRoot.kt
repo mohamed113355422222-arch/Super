@@ -98,11 +98,15 @@ import com.supershade.viewmodel.ShadePanel
 import com.supershade.viewmodel.ShadeTransitionEvent
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -111,7 +115,6 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.supershade.domain.notification.model.ShadeCategory
 import com.supershade.ui.theme.CyberpunkShadeTheme
 import com.supershade.ui.theme.NothingShadeTheme
@@ -128,7 +131,7 @@ fun ShadeRoot(
     viewModel: ShadeViewModel,
     onDismiss: () -> Unit,
 ) {
-    val state by viewModel.state.collectAsStateWithLifecycle()
+    val state by viewModel.state.collectAsState()
     var isEditingTiles by remember { mutableStateOf(false) }
     val isQsExpanded = state.isQsExpanded || isEditingTiles
     var mediaCollapsed by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
@@ -196,15 +199,24 @@ fun ShadeRoot(
     }
 
     val coroutineScope = rememberCoroutineScope()
-    // Collect interactive gesture flows as State<T> objects (not delegated) and read .value only inside
-    // graphicsLayer / drawBehind lambdas so drag frames never trigger recomposition or relayout.
-    val gestureProgressState = viewModel.gestureProgress.collectAsStateWithLifecycle()
-    val isGestureDraggingState = viewModel.isGestureDragging.collectAsStateWithLifecycle()
+    // Collect interactive gesture flows immediately without lifecycle-pause lag so the very first
+    // pull-down frame after View.VISIBLE renders smoothly in graphicsLayer / drawBehind.
+    val gestureProgressState = viewModel.gestureProgress.collectAsState()
+    val isGestureDraggingState = viewModel.isGestureDragging.collectAsState()
+    var isLocalDragging by remember { mutableStateOf(false) }
+    var localDragProgress by remember { mutableFloatStateOf(0f) }
     val revealAnimatable = remember { Animatable(0f) }
     val progressProvider: () -> Float = remember {
         {
-            if (isGestureDraggingState.value) gestureProgressState.value else revealAnimatable.value
+            when {
+                isGestureDraggingState.value -> gestureProgressState.value
+                isLocalDragging -> localDragProgress
+                else -> revealAnimatable.value
+            }
         }
+    }
+    val currentProgress: () -> Float = remember {
+        { if (isLocalDragging) localDragProgress else revealAnimatable.value }
     }
 
     val density = LocalDensity.current
@@ -237,20 +249,28 @@ fun ShadeRoot(
         }
     }
 
-    LaunchedEffect(state.activePanel) {
+    var wasOpenForPager by remember { mutableStateOf(state.isOpen) }
+    LaunchedEffect(state.isOpen, state.activePanel) {
         val targetPage = if (state.activePanel == ShadePanel.QUICK_SETTINGS) 1 else 0
-        if (pagerState.currentPage != targetPage) {
-            pagerState.animateScrollToPage(
-                targetPage,
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioLowBouncy,
-                    stiffness = Spring.StiffnessMediumLow,
+        val justOpened = !wasOpenForPager && state.isOpen
+        wasOpenForPager = state.isOpen
+        if (state.isOpen && pagerState.currentPage != targetPage) {
+            if (justOpened || (viewModel.isGestureDragging.value && progressProvider() < 0.25f) || revealAnimatable.value < 0.25f) {
+                pagerState.scrollToPage(targetPage)
+            } else {
+                pagerState.animateScrollToPage(
+                    targetPage,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioLowBouncy,
+                        stiffness = Spring.StiffnessMediumLow,
+                    )
                 )
-            )
+            }
         }
     }
 
     LaunchedEffect(pagerState.currentPage) {
+        if (!state.isOpen) return@LaunchedEffect
         val targetPanel = if (pagerState.currentPage == 1) ShadePanel.QUICK_SETTINGS else ShadePanel.NOTIFICATIONS
         if (state.activePanel != targetPanel) {
             haptics.sheetDetent()
@@ -259,43 +279,56 @@ fun ShadeRoot(
     }
 
     // Drive smooth open/close springs directly from interactive drag releases and close requests.
+    var lastHandledTransitionId by remember { mutableLongStateOf(0L) }
     LaunchedEffect(viewModel) {
         launch {
             viewModel.gestureProgress.collect { p ->
                 if (viewModel.isGestureDragging.value) {
+                    isLocalDragging = false
+                    localDragProgress = p
                     revealAnimatable.snapTo(p)
                 }
             }
         }
         launch {
-            viewModel.transitionEvent.collectLatest { event ->
-                when (event) {
-                    is ShadeTransitionEvent.FinishOpen -> {
-                        revealAnimatable.snapTo(event.progress.coerceIn(0f, 1.06f))
-                        revealAnimatable.animateTo(
-                            targetValue = 1f,
-                            animationSpec = spring(
-                                dampingRatio = 0.86f,
-                                stiffness = 460f,
-                            ),
-                            initialVelocity = event.velocity.coerceIn(0f, 12f),
-                        )
-                    }
-                    is ShadeTransitionEvent.FinishClose -> {
-                        val startP = if (event.progress > 0.001f) event.progress else revealAnimatable.value
-                        revealAnimatable.snapTo(startP.coerceIn(0f, 1.06f))
-                        if (revealAnimatable.value > 0.001f) {
+            viewModel.latestTransition.collectLatest { pending ->
+                if (pending != null && pending.id > lastHandledTransitionId) {
+                    lastHandledTransitionId = pending.id
+                    isLocalDragging = false
+                    when (val event = pending.event) {
+                        is ShadeTransitionEvent.FinishOpen -> {
+                            val startP = event.progress.coerceIn(0f, 1.06f)
+                            localDragProgress = startP
+                            revealAnimatable.snapTo(startP)
                             revealAnimatable.animateTo(
-                                targetValue = 0f,
+                                targetValue = 1f,
                                 animationSpec = spring(
-                                    dampingRatio = 0.94f,
-                                    stiffness = 560f,
+                                    dampingRatio = 0.86f,
+                                    stiffness = 460f,
                                 ),
-                                initialVelocity = event.velocity.coerceIn(-12f, 2f),
+                                initialVelocity = event.velocity.coerceIn(0f, 12f),
                             )
                         }
-                        if (!viewModel.isGestureDragging.value) {
-                            onDismiss()
+                        is ShadeTransitionEvent.FinishClose -> {
+                            val currP = currentProgress()
+                            if (!viewModel.state.value.isOpen && currP <= 0.001f) {
+                                return@collectLatest
+                            }
+                            val startP = if (event.progress > 0.001f) event.progress else currP
+                            revealAnimatable.snapTo(startP.coerceIn(0f, 1.06f))
+                            if (revealAnimatable.value > 0.001f) {
+                                revealAnimatable.animateTo(
+                                    targetValue = 0f,
+                                    animationSpec = spring(
+                                        dampingRatio = 0.94f,
+                                        stiffness = 560f,
+                                    ),
+                                    initialVelocity = event.velocity.coerceIn(-12f, 2f),
+                                )
+                            }
+                            if (!viewModel.isGestureDragging.value) {
+                                onDismiss()
+                            }
                         }
                     }
                 }
@@ -307,7 +340,12 @@ fun ShadeRoot(
     LaunchedEffect(state.isOpen) {
         if (state.isOpen) {
             openTimeMs = System.currentTimeMillis()
-            if (!viewModel.isGestureDragging.value && revealAnimatable.value <= 0.001f && !revealAnimatable.isRunning) {
+            if (!viewModel.isGestureDragging.value &&
+                !viewModel.isClosing.value &&
+                !isLocalDragging &&
+                revealAnimatable.value <= 0.001f &&
+                !revealAnimatable.isRunning
+            ) {
                 revealAnimatable.animateTo(
                     targetValue = 1f,
                     animationSpec = spring(dampingRatio = 0.86f, stiffness = 460f),
@@ -315,6 +353,8 @@ fun ShadeRoot(
             }
         } else {
             isEditingTiles = false
+            isLocalDragging = false
+            localDragProgress = 0f
             revealAnimatable.snapTo(0f)
         }
     }
@@ -327,10 +367,13 @@ fun ShadeRoot(
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                 if (isEditingTiles) return Offset.Zero
                 val dy = available.y
-                if (revealAnimatable.value < 0.999f && dy > 0f) {
-                    val next = (revealAnimatable.value + dy / revealDistancePx).coerceIn(0f, 1.06f)
-                    coroutineScope.launch { revealAnimatable.snapTo(next) }
-                    return Offset(0f, dy)
+                val curr = currentProgress()
+                if (curr < 0.999f && dy > 0f) {
+                    val maxRecoverPx = (1f - curr) * revealDistancePx
+                    val consumedY = dy.coerceAtMost(maxRecoverPx)
+                    isLocalDragging = true
+                    localDragProgress = (curr + consumedY / revealDistancePx).coerceIn(0f, 1f)
+                    return Offset(0f, consumedY)
                 }
                 // Swiping UP in Together mode while Quick Settings is expanded:
                 if (dy < -12f && isTogether && isQsExpanded) {
@@ -352,8 +395,9 @@ fun ShadeRoot(
                 }
                 // Overscrolling upward past list bottom smoothly collapses the shade
                 if (source == NestedScrollSource.UserInput && dy < 0f) {
-                    val next = (revealAnimatable.value + dy / revealDistancePx).coerceIn(0f, 1.06f)
-                    coroutineScope.launch { revealAnimatable.snapTo(next) }
+                    val next = (currentProgress() + dy / revealDistancePx).coerceIn(0f, 1.06f)
+                    isLocalDragging = true
+                    localDragProgress = next
                     return Offset(0f, dy)
                 }
                 return Offset.Zero
@@ -365,17 +409,25 @@ fun ShadeRoot(
 
             override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
                 val progressVelocity = (available.y / revealDistancePx).coerceIn(-12f, 12f)
-                val p = revealAnimatable.value
-                if (p < 0.999f || progressVelocity < -2.2f) {
-                    val shouldClose = p < 0.72f || (progressVelocity < -1.25f && p < 0.98f)
+                val p = currentProgress()
+                val wasDragging = isLocalDragging
+                isLocalDragging = false
+                if (wasDragging) {
+                    revealAnimatable.snapTo(p)
+                }
+                if (wasDragging && (p < 0.999f || progressVelocity < -2.2f)) {
+                    val shouldClose = p < 0.72f || (progressVelocity < -1.25f && p < 0.995f) || progressVelocity < -2.2f
                     if (shouldClose) {
                         haptics.sheetDetent()
+                        viewModel.beginClosing()
                         revealAnimatable.animateTo(
                             targetValue = 0f,
                             animationSpec = spring(dampingRatio = 0.94f, stiffness = 560f),
                             initialVelocity = progressVelocity.coerceIn(-12f, -1.5f),
                         )
-                        onDismiss()
+                        if (!viewModel.isGestureDragging.value && viewModel.isClosing.value) {
+                            onDismiss()
+                        }
                     } else {
                         revealAnimatable.animateTo(
                             targetValue = 1f,
@@ -448,11 +500,14 @@ fun ShadeRoot(
         }
     }
 
+    var isCardSwiping by remember { mutableStateOf(false) }
+
     CompositionLocalProvider(
         LocalShadeTheme provides state.theme,
         LocalCardBorderWidth provides state.cardBorderWidth,
         LocalShadeShapeScheme provides shapeScheme,
         LocalBackdropTheme provides backdropTheme,
+        LocalSwipeToDismissActive provides { active -> isCardSwiping = active },
     ) {
         themeWrapper {
             Box(modifier = Modifier.fillMaxSize()) {
@@ -500,6 +555,8 @@ fun ShadeRoot(
                     val isCombined = isTogether ||
                                      state.splitGestureMode == SplitGestureMode.ALWAYS_NOTIFICATIONS ||
                                      state.splitGestureMode == SplitGestureMode.ALWAYS_QUICK_SETTINGS
+                    val currentIsQsExpanded by rememberUpdatedState(isQsExpanded)
+                    val currentHasNotifications by rememberUpdatedState(state.visibleNotifications.isNotEmpty())
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -517,124 +574,147 @@ fun ShadeRoot(
                                 clip = visualP < 0.999f
                             }
                             .background(glassBackdrop)
-                            .pointerInput(isQsExpanded, isEditingTiles, isTogether, state.activePanel, state.visibleNotifications.size, revealDistancePx) {
+                            .pointerInput(isEditingTiles, isTogether, revealDistancePx) {
                                 if (isEditingTiles) return@pointerInput
                                 val px = this.density
                                 val edgeZonePx = (20f * px).toInt()
                                 val headerZonePx = (72f * px).toInt()
-                                val bottomHomeZonePx = (80f * px).toInt()
-                                val slopeMin = 0.55f
+                                val touchSlop = viewConfiguration.touchSlop
+                                val slopeMin = 1.15f
 
                                 awaitEachGesture {
                                     val down = awaitFirstDown(requireUnconsumed = false)
-                                    var consumed = false
+                                    var consumedInward = false
+                                    var lockedVertical = false
+                                    var handledRelease = false
                                     var lastY = down.position.y
                                     var totalDy = 0f
                                     var hasFiredDismissThresholdHaptic = false
                                     val tracker = VelocityTracker()
                                     tracker.addPosition(down.uptimeMillis, down.position)
 
-                                    val isTouchInHomeBarZone = down.position.y >= (size.height - bottomHomeZonePx)
-                                    val hasNotifications = state.visibleNotifications.isNotEmpty()
-                                    val isTouchOverScrollableFeed = !isTouchInHomeBarZone &&
-                                                                    down.position.y >= headerZonePx &&
-                                                                    down.position.y <= (size.height - bottomHomeZonePx) &&
-                                                                    (hasNotifications || (isTogether && !isQsExpanded))
+                                    val isTouchOverScrollableFeed =
+                                        down.position.y >= headerZonePx &&
+                                            (currentHasNotifications || (isTogether && !currentIsQsExpanded))
 
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                                        tracker.addPosition(change.uptimeMillis, change.position)
+                                    try {
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                            tracker.addPosition(change.uptimeMillis, change.position)
 
-                                        val dx = change.position.x - down.position.x
-                                        val dy = change.position.y - down.position.y
-                                        val deltaY = change.position.y - lastY
-                                        lastY = change.position.y
+                                            val dx = change.position.x - down.position.x
+                                            val dy = change.position.y - down.position.y
+                                            val deltaY = change.position.y - lastY
+                                            lastY = change.position.y
 
-                                        // Side edge inward swipe (predictive back)
-                                        val isHorizontalDominant = kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.6f
-                                        val isEdgeInwardDist = (down.position.x < edgeZonePx && dx > (42f * px)) ||
-                                                               (down.position.x > (size.width - edgeZonePx) && dx < -(42f * px))
-                                        val isInwardSwipe = isHorizontalDominant && isEdgeInwardDist && kotlin.math.abs(dy) < (40f * px)
-
-                                        if (!consumed && !isTouchOverScrollableFeed && isInwardSwipe) {
-                                            change.consume()
-                                            consumed = true
-                                            haptics.sheetDetent()
-                                            if (isTogether && isQsExpanded) {
-                                                coroutineScope.launch { viewModel.setQsExpanded(false) }
-                                            } else {
-                                                viewModel.requestAnimatedClose()
+                                            if (!lockedVertical && !consumedInward && change.isConsumed) {
+                                                if (!change.pressed) break
+                                                continue
                                             }
-                                            break
-                                        }
 
-                                        if (!isTouchOverScrollableFeed) {
-                                            val isDominantVertical = isTouchInHomeBarZone || kotlin.math.abs(dy) > kotlin.math.abs(dx) * slopeMin
-                                            if (isDominantVertical && (dy < -4f || dy > 4f || revealAnimatable.value < 0.999f)) {
+                                            // Side edge inward swipe (predictive back)
+                                            val isHorizontalDominant = kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.6f
+                                            val isEdgeInwardDist = (down.position.x < edgeZonePx && dx > (42f * px)) ||
+                                                                   (down.position.x > (size.width - edgeZonePx) && dx < -(42f * px))
+                                            val isInwardSwipe = isHorizontalDominant && isEdgeInwardDist && kotlin.math.abs(dy) < (40f * px)
+
+                                            if (!consumedInward && !lockedVertical && !isTouchOverScrollableFeed && isInwardSwipe) {
+                                                change.consume()
+                                                consumedInward = true
+                                                haptics.sheetDetent()
+                                                if (isTogether && currentIsQsExpanded) {
+                                                    coroutineScope.launch { viewModel.setQsExpanded(false) }
+                                                } else {
+                                                    viewModel.requestAnimatedClose()
+                                                }
+                                                break
+                                            }
+
+                                            if (!lockedVertical) {
+                                                val absDy = kotlin.math.abs(dy)
+                                                val absDx = kotlin.math.abs(dx)
+                                                val isDominantVertical = absDy > touchSlop && absDy > absDx * slopeMin
+                                                if (isDominantVertical && !change.isConsumed) {
+                                                    lockedVertical = true
+                                                    isLocalDragging = true
+                                                    localDragProgress = currentProgress()
+                                                    lastY = change.position.y
+                                                }
+                                            }
+
+                                            if (lockedVertical && change.pressed) {
+                                                change.consume()
                                                 totalDy = dy
-                                                val currentP = revealAnimatable.value
+                                                val currentP = localDragProgress
                                                 val deltaP = deltaY / revealDistancePx
                                                 val nextP = if (deltaY > 0f && currentP >= 1f) {
                                                     (currentP + deltaP * 0.25f).coerceIn(1f, 1.06f)
                                                 } else {
                                                     (currentP + deltaP).coerceIn(0f, 1.06f)
                                                 }
-                                                val thresholdP = if (isTouchInHomeBarZone) 0.85f else 0.72f
+                                                val thresholdP = 0.72f
                                                 if (nextP < thresholdP && !hasFiredDismissThresholdHaptic) {
                                                     haptics.sheetDetent()
                                                     hasFiredDismissThresholdHaptic = true
                                                 } else if (nextP >= thresholdP + 0.06f) {
                                                     hasFiredDismissThresholdHaptic = false
                                                 }
-                                                coroutineScope.launch {
-                                                    revealAnimatable.snapTo(nextP)
-                                                }
+                                                localDragProgress = nextP
                                             }
 
                                             if (!change.pressed) {
-                                                val velocityY = tracker.calculateVelocity().y
-                                                val progressVelocity = (velocityY / revealDistancePx).coerceIn(-12f, 12f)
-                                                val p = revealAnimatable.value
-                                                val thresholdP = if (isTouchInHomeBarZone) 0.85f else 0.72f
-                                                val minFlickVel = if (isTouchInHomeBarZone) -0.85f else -1.25f
-                                                val shouldClose = (p < thresholdP) ||
-                                                    (progressVelocity < minFlickVel && p < 0.98f && totalDy < -(8f * px))
-
-                                                if (shouldClose) {
-                                                    consumed = true
+                                                if (lockedVertical) {
                                                     change.consume()
-                                                    if (!isTouchInHomeBarZone && isTogether && isQsExpanded && progressVelocity > -2.5f && p > 0.65f) {
-                                                        haptics.sheetDetent()
-                                                        coroutineScope.launch {
-                                                            viewModel.setQsExpanded(false)
-                                                            revealAnimatable.animateTo(1f, spring(dampingRatio = 0.84f, stiffness = 440f))
-                                                        }
-                                                    } else {
-                                                        haptics.sheetDetent()
-                                                        coroutineScope.launch {
-                                                            revealAnimatable.animateTo(
-                                                                targetValue = 0f,
-                                                                animationSpec = spring(dampingRatio = 0.94f, stiffness = 560f),
-                                                                initialVelocity = progressVelocity.coerceIn(-12f, -1.5f),
-                                                            )
-                                                            onDismiss()
-                                                        }
-                                                    }
-                                                } else if (kotlin.math.abs(p - 1f) > 0.001f) {
+                                                    handledRelease = true
+                                                    val velocityY = tracker.calculateVelocity().y
+                                                    val progressVelocity = (velocityY / revealDistancePx).coerceIn(-12f, 12f)
+                                                    val p = localDragProgress
+                                                    isLocalDragging = false
+                                                    val shouldClose = (p < 0.72f) ||
+                                                        (progressVelocity < -1.25f && p < 0.995f && totalDy < -(8f * px)) ||
+                                                        (progressVelocity < -2.2f)
+
                                                     coroutineScope.launch {
-                                                        revealAnimatable.animateTo(
-                                                            targetValue = 1f,
-                                                            animationSpec = spring(dampingRatio = 0.84f, stiffness = 440f),
-                                                            initialVelocity = progressVelocity.coerceIn(-2f, 12f),
-                                                        )
+                                                        revealAnimatable.snapTo(p)
+                                                        if (shouldClose) {
+                                                            if (isTogether && currentIsQsExpanded && progressVelocity > -2.5f && p > 0.65f) {
+                                                                haptics.sheetDetent()
+                                                                viewModel.setQsExpanded(false)
+                                                                revealAnimatable.animateTo(1f, spring(dampingRatio = 0.84f, stiffness = 440f))
+                                                            } else {
+                                                                haptics.sheetDetent()
+                                                                viewModel.beginClosing()
+                                                                revealAnimatable.animateTo(
+                                                                    targetValue = 0f,
+                                                                    animationSpec = spring(dampingRatio = 0.94f, stiffness = 560f),
+                                                                    initialVelocity = progressVelocity.coerceIn(-12f, -1.5f),
+                                                                )
+                                                                if (!viewModel.isGestureDragging.value && viewModel.isClosing.value) {
+                                                                    onDismiss()
+                                                                }
+                                                            }
+                                                        } else if (kotlin.math.abs(p - 1f) > 0.001f) {
+                                                            revealAnimatable.animateTo(
+                                                                targetValue = 1f,
+                                                                animationSpec = spring(dampingRatio = 0.84f, stiffness = 440f),
+                                                                initialVelocity = progressVelocity.coerceIn(-2f, 12f),
+                                                            )
+                                                        }
                                                     }
                                                 }
                                                 break
                                             }
-                                        } else {
-                                            if (!change.pressed) {
-                                                break
+                                        }
+                                    } finally {
+                                        if (lockedVertical && !handledRelease && isLocalDragging) {
+                                            val recoverP = localDragProgress
+                                            isLocalDragging = false
+                                            coroutineScope.launch {
+                                                revealAnimatable.snapTo(recoverP)
+                                                if (!viewModel.isGestureDragging.value && !viewModel.isClosing.value) {
+                                                    revealAnimatable.animateTo(1f, spring(dampingRatio = 0.84f, stiffness = 440f))
+                                                }
                                             }
                                         }
                                     }
@@ -744,19 +824,39 @@ fun ShadeRoot(
                                     Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .draggable(
-                                                orientation = Orientation.Vertical,
-                                                enabled = !isEditingTiles,
-                                                state = rememberDraggableState { delta ->
-                                                    if (delta > 10f && !isQsExpanded) {
-                                                        haptics.sheetDetent()
-                                                        viewModel.setQsExpanded(true)
-                                                    } else if (delta < -10f && isQsExpanded) {
-                                                        haptics.sheetDetent()
-                                                        viewModel.setQsExpanded(false)
+                                            .pointerInput(isEditingTiles, isQsExpanded) {
+                                                if (isEditingTiles) return@pointerInput
+                                                val slop = viewConfiguration.touchSlop
+                                                awaitEachGesture {
+                                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                                    var totalDx = 0f
+                                                    var totalDy = 0f
+                                                    while (true) {
+                                                        val event = awaitPointerEvent()
+                                                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                        if (!change.pressed || change.isConsumed) break
+                                                        val d = change.position - change.previousPosition
+                                                        totalDx += d.x
+                                                        totalDy += d.y
+                                                        if (kotlin.math.abs(totalDy) > slop && kotlin.math.abs(totalDy) > kotlin.math.abs(totalDx)) {
+                                                            if (totalDy > 0f && !isQsExpanded) {
+                                                                change.consume()
+                                                                haptics.sheetDetent()
+                                                                viewModel.setQsExpanded(true)
+                                                                break
+                                                            } else if (totalDy < 0f && isQsExpanded) {
+                                                                change.consume()
+                                                                haptics.sheetDetent()
+                                                                viewModel.setQsExpanded(false)
+                                                                break
+                                                            } else {
+                                                                // Yield to Column.verticalScroll / ShadeRoot collapse
+                                                                break
+                                                            }
+                                                        }
                                                     }
                                                 }
-                                            )
+                                            }
                                     ) {
                                         PixelQuickSettingsGrid(
                                             tiles = state.tiles,
@@ -794,19 +894,39 @@ fun ShadeRoot(
                                     Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .draggable(
-                                                orientation = Orientation.Vertical,
-                                                enabled = !isEditingTiles,
-                                                state = rememberDraggableState { delta ->
-                                                    if (delta > 10f && !isQsExpanded) {
-                                                        haptics.sheetDetent()
-                                                        viewModel.setQsExpanded(true)
-                                                    } else if (delta < -10f && isQsExpanded) {
-                                                        haptics.sheetDetent()
-                                                        viewModel.setQsExpanded(false)
+                                            .pointerInput(isEditingTiles, isQsExpanded) {
+                                                if (isEditingTiles) return@pointerInput
+                                                val slop = viewConfiguration.touchSlop
+                                                awaitEachGesture {
+                                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                                    var totalDx = 0f
+                                                    var totalDy = 0f
+                                                    while (true) {
+                                                        val event = awaitPointerEvent()
+                                                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                        if (!change.pressed || change.isConsumed) break
+                                                        val d = change.position - change.previousPosition
+                                                        totalDx += d.x
+                                                        totalDy += d.y
+                                                        if (kotlin.math.abs(totalDy) > slop && kotlin.math.abs(totalDy) > kotlin.math.abs(totalDx)) {
+                                                            if (totalDy > 0f && !isQsExpanded) {
+                                                                change.consume()
+                                                                haptics.sheetDetent()
+                                                                viewModel.setQsExpanded(true)
+                                                                break
+                                                            } else if (totalDy < 0f && isQsExpanded) {
+                                                                change.consume()
+                                                                haptics.sheetDetent()
+                                                                viewModel.setQsExpanded(false)
+                                                                break
+                                                            } else {
+                                                                // Yield to Column.verticalScroll / ShadeRoot collapse
+                                                                break
+                                                            }
+                                                        }
                                                     }
                                                 }
-                                            )
+                                            }
                                     ) {
                                         QuickSettingsGrid(
                                             tiles = state.tiles,
@@ -957,7 +1077,7 @@ fun ShadeRoot(
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxWidth(),
-                            userScrollEnabled = !isEditingTiles,
+                            userScrollEnabled = !isEditingTiles && !isCardSwiping,
                             beyondViewportPageCount = 1,
                         ) { page ->
                             val pageOffset = (pagerState.currentPage - page) + pagerState.currentPageOffsetFraction
@@ -1316,31 +1436,38 @@ fun ShadeRoot(
                                 .draggable(
                                     orientation = Orientation.Vertical,
                                     enabled = !isEditingTiles,
+                                    onDragStarted = {
+                                        isLocalDragging = true
+                                        localDragProgress = currentProgress()
+                                    },
                                     state = rememberDraggableState { delta ->
-                                        coroutineScope.launch {
-                                            val nextP = (revealAnimatable.value + delta / revealDistancePx).coerceIn(0f, 1.02f)
-                                            if (nextP < 0.85f && !hasHandleFiredHaptic) {
-                                                haptics.sheetDetent()
-                                                hasHandleFiredHaptic = true
-                                            } else if (nextP >= 0.90f) {
-                                                hasHandleFiredHaptic = false
-                                            }
-                                            revealAnimatable.snapTo(nextP)
+                                        val nextP = (localDragProgress + delta / revealDistancePx).coerceIn(0f, 1.02f)
+                                        if (nextP < 0.85f && !hasHandleFiredHaptic) {
+                                            haptics.sheetDetent()
+                                            hasHandleFiredHaptic = true
+                                        } else if (nextP >= 0.90f) {
+                                            hasHandleFiredHaptic = false
                                         }
+                                        localDragProgress = nextP
                                     },
                                     onDragStopped = { velocity ->
                                         hasHandleFiredHaptic = false
                                         val progressVelocity = (velocity / revealDistancePx).coerceIn(-12f, 12f)
-                                        val p = revealAnimatable.value
+                                        val p = localDragProgress
+                                        isLocalDragging = false
                                         coroutineScope.launch {
-                                            if (p < 0.85f || (progressVelocity < -0.85f && p < 0.99f)) {
+                                            revealAnimatable.snapTo(p)
+                                            if (p < 0.85f || (progressVelocity < -0.85f && p < 0.995f)) {
                                                 haptics.sheetDetent()
+                                                viewModel.beginClosing()
                                                 revealAnimatable.animateTo(
                                                     targetValue = 0f,
                                                     animationSpec = spring(dampingRatio = 0.94f, stiffness = 560f),
                                                     initialVelocity = progressVelocity.coerceIn(-12f, -1.5f),
                                                 )
-                                                onDismiss()
+                                                if (!viewModel.isGestureDragging.value && viewModel.isClosing.value) {
+                                                    onDismiss()
+                                                }
                                             } else {
                                                 revealAnimatable.animateTo(
                                                     targetValue = 1f,

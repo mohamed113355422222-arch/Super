@@ -45,9 +45,11 @@ class TopSwipeGestureHelper(
     }
 
     fun onTouch(v: View, event: MotionEvent): Boolean {
-        // Reject new gestures when shade is already open, unless this helper owns the active pull.
-        if (isShadeOpen() && mode != GestureMode.SHADE_PULL) {
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) return false
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            // Reset any leftover gesture mode from a missed UP/CANCEL before evaluating open state.
+            resetState()
+            if (isShadeOpen()) return false
+        } else if (isShadeOpen() && mode != GestureMode.SHADE_PULL) {
             return false
         }
 
@@ -56,7 +58,7 @@ class TopSwipeGestureHelper(
         val screenWidth = dm.widthPixels.coerceAtLeast(1)
         val screenHeight = dm.heightPixels.coerceAtLeast(1)
         val revealDistancePx = computeRevealDistancePx(screenHeight, density)
-        val pullStartThresholdPx = (8f * density).coerceAtLeast(12f)
+        val pullStartThresholdPx = (6f * density).coerceAtLeast(10f)
         val horizontalScrubThresholdPx = 20f * density
         val edgeExclusionPx = 10f * density
 
@@ -96,7 +98,7 @@ class TopSwipeGestureHelper(
                         }
 
                         val isFlingDown =
-                            yVelocity > (650f * density) && deltaY > (4f * density) && deltaY > deltaX
+                            yVelocity > (600f * density) && deltaY > (4f * density) && deltaY > deltaX
                         val isStandardPull =
                             deltaY > pullStartThresholdPx && deltaY > deltaX * 1.05f
 

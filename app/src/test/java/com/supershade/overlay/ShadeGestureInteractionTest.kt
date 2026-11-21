@@ -117,15 +117,105 @@ class ShadeGestureInteractionTest {
             assertEquals(0.54f, openEvent!!.progress, 0.001f)
             assertEquals(3.1f, openEvent.velocity, 0.001f)
 
-            // 4. Request animated close -> emits FinishClose, then completeClose resets isOpen=false
+            // 4. Request animated close -> emits FinishClose with isClosing=true, then completeClose resets everything
             vm.requestAnimatedClose()
             org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            assertTrue(vm.isClosing.value)
             assertTrue(events.lastOrNull() is ShadeTransitionEvent.FinishClose)
+            assertTrue(vm.latestTransition.value?.event is ShadeTransitionEvent.FinishClose)
+            val closeId = vm.latestTransition.value!!.id
+
+            // 5. Re-opening mid-close clears isClosing and delivers a strictly newer transition ID
+            vm.beginInteractiveOpen(expandQs = false)
+            assertFalse(vm.isClosing.value)
+            assertTrue(vm.state.value.isOpen)
+            vm.endInteractiveOpen(shouldOpen = true, progress = 0.65f, progressVelocity = 2.0f)
+            assertTrue((vm.latestTransition.value?.id ?: 0L) > closeId)
+
+            // 6. Local upward collapse immediately marks isClosing so shade is re-openable mid-spring
+            vm.beginClosing()
+            assertTrue(vm.isClosing.value)
+            assertFalse(vm.isGestureDragging.value)
+
             vm.completeClose()
             assertFalse(vm.state.value.isOpen)
+            assertFalse(vm.isClosing.value)
             assertEquals(0f, vm.gestureProgress.value, 0.001f)
+            assertEquals(null, vm.latestTransition.value)
         } finally {
             job.cancel()
         }
+    }
+
+    @Test
+    fun topSwipeHelper_streamsContinuousSwipeOpenAndRecoversFromMissedUp() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val view = android.view.View(context)
+        var shadeOpen = false
+        var began = false
+        val progressSamples = mutableListOf<Float>()
+        var endedShouldOpen: Boolean? = null
+
+        val helper = TopSwipeGestureHelper(
+            context = context,
+            isShadeOpen = { shadeOpen },
+            splitGestureMode = { com.supershade.settings.SplitGestureMode.ALWAYS_NOTIFICATIONS },
+            onBeginSwipeOpen = { began = true },
+            onUpdateSwipeProgress = { progressSamples.add(it) },
+            onEndSwipeOpen = { shouldOpen, _, _ -> endedShouldOpen = shouldOpen },
+        )
+
+        // Start a pull down, then abandon without UP/CANCEL, then start a second fresh pull down
+        val t0 = 1000L
+        val down1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, 300f, 10f, 0)
+        assertTrue(helper.onTouch(view, down1))
+        down1.recycle()
+
+        // Fresh ACTION_DOWN must reset prior state and accept events when !isShadeOpen
+        val t1 = 2000L
+        val down2 = android.view.MotionEvent.obtain(t1, t1, android.view.MotionEvent.ACTION_DOWN, 300f, 10f, 0)
+        assertTrue(helper.onTouch(view, down2))
+
+        val move1 = android.view.MotionEvent.obtain(t1, t1 + 16, android.view.MotionEvent.ACTION_MOVE, 300f, 80f, 0)
+        val move2 = android.view.MotionEvent.obtain(t1, t1 + 32, android.view.MotionEvent.ACTION_MOVE, 300f, 260f, 0)
+        val up = android.view.MotionEvent.obtain(t1, t1 + 48, android.view.MotionEvent.ACTION_UP, 300f, 340f, 0)
+
+        assertTrue(helper.onTouch(view, move1))
+        assertTrue(helper.onTouch(view, move2))
+        assertTrue(helper.onTouch(view, up))
+
+        down2.recycle()
+        move1.recycle()
+        move2.recycle()
+        up.recycle()
+
+        assertTrue("Expected interactive open to start", began)
+        assertTrue("Expected >= 2 continuous progress updates", progressSamples.size >= 2)
+        assertTrue("Expected monotonically increasing progress", progressSamples.last() > progressSamples.first())
+        assertEquals(true, endedShouldOpen)
+
+        // When shade reports open (and not closing), helper refuses new pull-down
+        shadeOpen = true
+        val downBlocked = android.view.MotionEvent.obtain(3000L, 3000L, android.view.MotionEvent.ACTION_DOWN, 300f, 10f, 0)
+        assertFalse(helper.onTouch(view, downBlocked))
+        downBlocked.recycle()
+    }
+
+    @Test
+    fun statusBarGovernor_neverDisablesExpansionWithoutTouchCapture() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val connector = ShizukuPlusConnector(context)
+        val governor = StatusBarGovernor(context, connector)
+
+        governor.disableExpansion()
+        // Safety invariant: must stay false while touchCaptureAvailable == false
+        assertFalse(governor.isExpansionEffectivelyDisabled())
+
+        governor.updateTouchCaptureAvailability(true)
+        assertTrue(governor.isExpansionEffectivelyDisabled())
+
+        // Detaching overlay/accessibility capture must immediately re-enable native expansion
+        governor.updateTouchCaptureAvailability(false)
+        assertFalse(governor.isExpansionEffectivelyDisabled())
     }
 }

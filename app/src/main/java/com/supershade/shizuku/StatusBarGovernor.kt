@@ -21,6 +21,7 @@ class StatusBarGovernor(
     @Volatile private var commander: IShadeCommander? = null
     @Volatile private var shouldDisableExpansion = false
     @Volatile private var shouldHideSystemStatusBar = false
+    @Volatile private var touchCaptureAvailable = false
 
     private val _isCommanderConnected = kotlinx.coroutines.flow.MutableStateFlow(false)
     val isCommanderConnected: kotlinx.coroutines.flow.StateFlow<Boolean> = _isCommanderConnected
@@ -51,7 +52,7 @@ class StatusBarGovernor(
             android.util.Log.i("StatusBarGovernor", "ShadeCommanderService bound successfully via Shizuku!")
             commander = IShadeCommander.Stub.asInterface(service)
             _isCommanderConnected.value = true
-            if (shouldDisableExpansion || shouldHideSystemStatusBar) {
+            if (effectiveDisableExpansion() || shouldHideSystemStatusBar) {
                 serviceScope.launch {
                     applyCombinedDisableFlags()
                 }
@@ -72,7 +73,7 @@ class StatusBarGovernor(
             .onEach { connected ->
                 if (connected && connector.hasPermission()) {
                     bindService()
-                    if (shouldDisableExpansion || shouldHideSystemStatusBar) {
+                    if (effectiveDisableExpansion() || shouldHideSystemStatusBar) {
                         applyCombinedDisableFlags()
                     }
                 } else if (!connected) {
@@ -86,7 +87,7 @@ class StatusBarGovernor(
             .onEach { granted ->
                 if (granted && connector.isConnected.value) {
                     bindService()
-                    if (shouldDisableExpansion || shouldHideSystemStatusBar) {
+                    if (effectiveDisableExpansion() || shouldHideSystemStatusBar) {
                         applyCombinedDisableFlags()
                     }
                 } else if (!granted) {
@@ -95,6 +96,26 @@ class StatusBarGovernor(
             }
             .launchIn(CoroutineScope(SupervisorJob() + Dispatchers.Main))
     }
+
+    private fun effectiveDisableExpansion(): Boolean =
+        shouldDisableExpansion && touchCaptureAvailable
+
+    /**
+     * Updates whether an interactive SuperShade touch-capture overlay is currently attached.
+     * Safety invariant: native status bar expansion is never disabled without an active
+     * gesture capture layer, and is immediately re-enabled if capture detaches.
+     */
+    fun updateTouchCaptureAvailability(available: Boolean) {
+        if (touchCaptureAvailable == available) return
+        touchCaptureAvailable = available
+        if (shouldDisableExpansion) {
+            serviceScope.launch {
+                applyCombinedDisableFlags()
+            }
+        }
+    }
+
+    fun isExpansionEffectivelyDisabled(): Boolean = effectiveDisableExpansion()
 
     fun bindService() {
         if (!connector.hasPermission()) {
@@ -179,7 +200,7 @@ class StatusBarGovernor(
             return@withContext false
         }
         val flags = buildList {
-            if (shouldDisableExpansion) add("statusbar-expansion")
+            if (effectiveDisableExpansion()) add("statusbar-expansion")
             if (shouldHideSystemStatusBar) {
                 add("system-icons")
                 add("clock")

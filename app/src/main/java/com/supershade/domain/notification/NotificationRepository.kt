@@ -61,6 +61,8 @@ class NotificationRepository(
             val flags = sbn.notification?.flags ?: return false
             return (flags and android.app.Notification.FLAG_ONGOING_EVENT) != 0
         }
+
+        private const val DISMISS_TOMBSTONE_TTL_MS = 4_000L
     }
 
     private val categoryEngine = CategoryEngine()
@@ -115,8 +117,17 @@ class NotificationRepository(
     var snoozer: ((String, Long) -> Unit)? = null
     var clearAller: (() -> Unit)? = null
 
+    private data class DismissedTombstone(
+        val postTime: Long,
+        val expiresAtMs: Long,
+    )
+
     // key → timestamp when snooze expires; in-memory only, reset on service restart
     private val snoozedUntil = mutableMapOf<String, Long>()
+    // keys recently restored via undoLastDismiss so refresh() doesn't immediately prune them
+    private val recentUndoKeys = mutableMapOf<String, Long>()
+    // keys recently dismissed so in-flight NMS syncActiveNotifications / updates don't resurrect them
+    private val recentDismissedKeys = java.util.concurrent.ConcurrentHashMap<String, DismissedTombstone>()
 
     private fun sortNotifications(list: List<ShadeNotification>): List<ShadeNotification> {
         val pinned = _pinnedKeys.value
@@ -196,6 +207,8 @@ class NotificationRepository(
     fun undoLastDismiss() {
         val note = _lastDismissed.value ?: return
         _lastDismissed.value = null
+        recentDismissedKeys.remove(note.key)
+        recentUndoKeys[note.key] = System.currentTimeMillis() + 5_000L
         _dismissedHistory.update { current -> current.filter { it.key != note.key } }
         _notifications.update { current ->
             sortNotifications(listOf(note) + current.filter { it.key != note.key })
@@ -210,10 +223,53 @@ class NotificationRepository(
         com.supershade.service.NotificationCollector.instance?.refreshNotifications()
     }
 
+    /**
+     * Synchronizes repository state with the live system active notifications list:
+     * posts/updates present notifications and prunes stale notifications whose keys
+     * are no longer active in Android's NotificationManager.
+     */
+    fun syncActiveNotifications(
+        activeList: List<StatusBarNotification>,
+        rankingMap: android.service.notification.NotificationListenerService.RankingMap? = null,
+    ) {
+        val now = System.currentTimeMillis()
+        recentUndoKeys.entries.removeIf { it.value <= now }
+        recentDismissedKeys.entries.removeIf { it.value.expiresAtMs <= now }
+        val activeKeySet = activeList.mapTo(HashSet(activeList.size)) { it.key }
+        activeList.forEach { onNotificationPosted(it, rankingMap) }
+
+        val staleKeys = activeSbns.keys.filter { it !in activeKeySet }
+        staleKeys.forEach { activeSbns.remove(it) }
+
+        _voiceRecorderNotification.value?.let { voiceNote ->
+            if (voiceNote.key !in activeKeySet) {
+                _voiceRecorderNotification.value = null
+            }
+        }
+        _notifications.update { current ->
+            current.filter { note ->
+                val tombstone = recentDismissedKeys[note.key]
+                val blockedByDismiss = tombstone != null && now < tombstone.expiresAtMs && note.postTime <= tombstone.postTime
+                !blockedByDismiss && (note.key in activeKeySet || note.key in recentUndoKeys)
+            }
+        }
+    }
+
     fun onNotificationPosted(
         sbn: StatusBarNotification,
         rankingMap: android.service.notification.NotificationListenerService.RankingMap? = null,
     ) {
+        val now = System.currentTimeMillis()
+        val tombstone = recentDismissedKeys[sbn.key]
+        if (tombstone != null) {
+            if (now < tombstone.expiresAtMs && sbn.postTime <= tombstone.postTime) {
+                activeSbns.remove(sbn.key)
+                return
+            } else {
+                recentDismissedKeys.remove(sbn.key, tombstone)
+            }
+        }
+
         activeSbns[sbn.key] = sbn
 
         // Apps like Samsung Voice Recorder post an ongoing MediaStyle service notification
@@ -239,14 +295,23 @@ class NotificationRepository(
             val without = current.filter { it.key != shade.key }
             // If this is a group summary and we already have child notifications for
             // this group, omit the summary — children carry all the visible content.
-            if (shade.isGroupSummary && without.any {
+            if (shade.isGroupSummary && !shade.groupKey.isNullOrBlank() && without.any {
                     it.packageName == shade.packageName &&
                     it.groupKey == shade.groupKey &&
                     !it.isGroupSummary
                 }) {
                 without
             } else {
-                sortNotifications(listOf(shade) + without)
+                val cleaned = if (!shade.isGroupSummary && !shade.groupKey.isNullOrBlank()) {
+                    without.filterNot {
+                        it.isGroupSummary &&
+                            it.packageName == shade.packageName &&
+                            it.groupKey == shade.groupKey
+                    }
+                } else {
+                    without
+                }
+                sortNotifications(listOf(shade) + cleaned)
             }
         }
 
@@ -282,14 +347,61 @@ class NotificationRepository(
         _notifications.update { current -> current.filter { it.key != key } }
     }
 
+    private fun cancelOrphanGroupSummaries(
+        affectedGroups: Set<Pair<String, String>>,
+        alreadyCancelledKeys: Set<String>,
+    ) {
+        if (affectedGroups.isEmpty()) return
+        val remaining = _notifications.value
+        val orphanSummaryKeys = mutableListOf<String>()
+        for ((pkg, grp) in affectedGroups) {
+            val hasRemainingChild = remaining.any {
+                it.packageName == pkg && it.groupKey == grp && !it.isGroupSummary
+            }
+            if (!hasRemainingChild) {
+                activeSbns.values
+                    .filter { sbn ->
+                        sbn.packageName == pkg &&
+                            sbn.notification.group == grp &&
+                            (sbn.notification.flags and android.app.Notification.FLAG_GROUP_SUMMARY) != 0 &&
+                            sbn.isClearable &&
+                            sbn.key !in alreadyCancelledKeys
+                    }
+                    .forEach { summarySbn ->
+                        orphanSummaryKeys.add(summarySbn.key)
+                    }
+            }
+        }
+        if (orphanSummaryKeys.isNotEmpty()) {
+            val tombstoneExpiry = System.currentTimeMillis() + DISMISS_TOMBSTONE_TTL_MS
+            orphanSummaryKeys.forEach { key ->
+                val postTime = activeSbns.remove(key)?.postTime ?: Long.MAX_VALUE
+                recentDismissedKeys[key] = DismissedTombstone(postTime = postTime, expiresAtMs = tombstoneExpiry)
+            }
+            if (batchCanceller != null) {
+                batchCanceller?.invoke(orphanSummaryKeys)
+            } else {
+                orphanSummaryKeys.forEach { k -> canceller?.invoke(k) }
+            }
+            _notifications.update { current -> current.filterNot { it.key in orphanSummaryKeys } }
+        }
+    }
+
     fun cancelAndRemove(key: String): Boolean {
         val target = _notifications.value.find { it.key == key }
         if (target != null && !target.isClearable) {
             return false
         }
+        val now = System.currentTimeMillis()
+        recentUndoKeys.remove(key)
+        val dismissedPostTime = target?.postTime ?: activeSbns[key]?.postTime ?: now
+        recentDismissedKeys[key] = DismissedTombstone(
+            postTime = dismissedPostTime,
+            expiresAtMs = now + DISMISS_TOMBSTONE_TTL_MS,
+        )
         if (target != null) {
             _lastDismissed.value = target
-            val elapsed = System.currentTimeMillis() - target.postTime
+            val elapsed = now - target.postTime
             val isFast = elapsed in 0..4000L
             adaptiveLoop?.recordInteraction(
                 target.packageName,
@@ -299,6 +411,10 @@ class NotificationRepository(
         }
         canceller?.invoke(key)
         onNotificationRemoved(key)
+        val groupKey = target?.groupKey
+        if (target != null && !groupKey.isNullOrBlank()) {
+            cancelOrphanGroupSummaries(setOf(target.packageName to groupKey), setOf(key))
+        }
         return true
     }
 
@@ -310,9 +426,11 @@ class NotificationRepository(
 
         val dismissibleKeys = dismissible.map { it.key }
         val dismissibleKeySet = dismissibleKeys.toSet()
+        dismissibleKeys.forEach { recentUndoKeys.remove(it) }
         _lastDismissed.value = dismissible.first()
 
         val now = System.currentTimeMillis()
+        val tombstoneExpiry = now + DISMISS_TOMBSTONE_TTL_MS
         val newRecords = dismissible
             .filter { it.packageName != "com.supershade" }
             .map { removed ->
@@ -330,6 +448,7 @@ class NotificationRepository(
             }
 
         dismissible.forEach { target ->
+            recentDismissedKeys[target.key] = DismissedTombstone(target.postTime, tombstoneExpiry)
             activeSbns.remove(target.key)
             if (_voiceRecorderNotification.value?.key == target.key) {
                 _voiceRecorderNotification.value = null
@@ -355,6 +474,12 @@ class NotificationRepository(
         } else {
             dismissibleKeys.forEach { k -> canceller?.invoke(k) }
         }
+
+        val affectedGroups = dismissible
+            .mapNotNull { n -> n.groupKey?.takeIf { it.isNotBlank() }?.let { n.packageName to it } }
+            .toSet()
+        cancelOrphanGroupSummaries(affectedGroups, dismissibleKeySet)
+
         return dismissible.size
     }
 
@@ -363,31 +488,53 @@ class NotificationRepository(
         val pinned = _pinnedKeys.value
         // Pinned and ongoing notifications are immune to Clear all
         val dismissible = _notifications.value.filter { it.isClearable && it.key !in pinned }
-        val newRecords = dismissible.map { note ->
-            DismissedNotificationRecord(
-                key = note.key,
-                packageName = note.packageName,
-                title = note.title,
-                text = note.text,
-                postTime = note.postTime,
-                dismissedTime = now,
-                category = note.category,
-                isClearable = note.isClearable,
-                channelId = note.channelId,
-            )
-        }
-        _dismissedHistory.update { current ->
-            (newRecords + current).distinctBy { it.key }.take(60)
+        if (dismissible.isEmpty()) return
+
+        val dismissibleKeys = dismissible.map { it.key }
+        val dismissibleKeySet = dismissibleKeys.toSet()
+        dismissibleKeys.forEach { recentUndoKeys.remove(it) }
+        _lastDismissed.value = null
+        val tombstoneExpiry = now + DISMISS_TOMBSTONE_TTL_MS
+
+        val newRecords = dismissible
+            .filter { it.packageName != "com.supershade" }
+            .map { note ->
+                DismissedNotificationRecord(
+                    key = note.key,
+                    packageName = note.packageName,
+                    title = note.title,
+                    text = note.text,
+                    postTime = note.postTime,
+                    dismissedTime = now,
+                    category = note.category,
+                    isClearable = note.isClearable,
+                    channelId = note.channelId,
+                )
+            }
+        if (newRecords.isNotEmpty()) {
+            _dismissedHistory.update { current ->
+                (newRecords + current).distinctBy { it.key }.take(60)
+            }
         }
         dismissible.forEach { note ->
+            recentDismissedKeys[note.key] = DismissedTombstone(note.postTime, tombstoneExpiry)
+            activeSbns.remove(note.key)
             adaptiveLoop?.recordInteraction(note.packageName, note.channelId, NotificationInteractionType.CLEAR_ALL)
         }
-        if (clearAller != null) {
-            clearAller?.invoke()
-        } else {
-            dismissible.forEach { note -> canceller?.invoke(note.key) }
-        }
         _notifications.update { current -> current.filter { !it.isClearable || it.key in pinned } }
+
+        if (pinned.isEmpty() && clearAller != null) {
+            clearAller?.invoke()
+        } else if (batchCanceller != null) {
+            batchCanceller?.invoke(dismissibleKeys)
+        } else {
+            dismissibleKeys.forEach { key -> canceller?.invoke(key) }
+        }
+
+        val affectedGroups = dismissible
+            .mapNotNull { n -> n.groupKey?.takeIf { it.isNotBlank() }?.let { n.packageName to it } }
+            .toSet()
+        cancelOrphanGroupSummaries(affectedGroups, dismissibleKeySet)
     }
 
     fun recordLaunch(note: ShadeNotification) {

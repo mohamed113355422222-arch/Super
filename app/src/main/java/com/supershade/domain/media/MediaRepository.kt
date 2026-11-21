@@ -2,6 +2,7 @@ package com.supershade.domain.media
 
 import android.content.ComponentName
 import android.content.Context
+import android.graphics.Bitmap
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -9,9 +10,15 @@ import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
 import com.supershade.service.NotificationCollector
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 class MediaRepository(private val context: Context) {
 
@@ -22,9 +29,13 @@ class MediaRepository(private val context: Context) {
         context.getSystemService(MediaSessionManager::class.java)
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var activeController: MediaController? = null
+    private var artDecodeJob: Job? = null
+    @Volatile private var cachedArtUri: String? = null
+    @Volatile private var cachedArtBitmap: Bitmap? = null
 
-    // Bug 1: track whether the listener was successfully registered
+    // Track whether the listener was successfully registered
     private var listenerRegistered = false
 
     private val controllerCallback = object : MediaController.Callback() {
@@ -46,7 +57,6 @@ class MediaRepository(private val context: Context) {
         try {
             val component = ComponentName(context, NotificationCollector::class.java)
             sessionManager.addOnActiveSessionsChangedListener(sessionsListener, component, mainHandler)
-            // Bug 1: only set to true after the call succeeds
             listenerRegistered = true
             refresh()
         } catch (_: SecurityException) {}
@@ -68,9 +78,10 @@ class MediaRepository(private val context: Context) {
     fun seekTo(positionMs: Long) { activeController?.transportControls?.seekTo(positionMs) }
 
     fun dispose() {
+        artDecodeJob?.cancel()
+        ioScope.cancel()
         activeController?.unregisterCallback(controllerCallback)
         activeController = null
-        // Bug 1: guard remove call so it only runs when the listener was registered
         if (listenerRegistered) {
             try { sessionManager.removeOnActiveSessionsChangedListener(sessionsListener) } catch (_: Exception) {}
             listenerRegistered = false
@@ -84,7 +95,6 @@ class MediaRepository(private val context: Context) {
             it.playbackState?.state == PlaybackState.STATE_PLAYING
         } ?: controllers?.firstOrNull()
 
-        // Bug 2: skip emission entirely when both sides are already null
         if (best == null && _media.value == null) return
 
         if (best?.sessionToken != activeController?.sessionToken) {
@@ -99,30 +109,55 @@ class MediaRepository(private val context: Context) {
 
     private fun updateFromController(controller: MediaController?) {
         val meta = controller?.metadata
-        val newArt = meta?.getBitmap(MediaMetadata.METADATA_KEY_ART)
-            ?: meta?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-        val artUriStr = meta?.getString(MediaMetadata.METADATA_KEY_ART_URI)
-            ?: meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
-        val uriArt = if (newArt == null && !artUriStr.isNullOrBlank()) {
-            try {
-                val uri = android.net.Uri.parse(artUriStr)
-                context.contentResolver.openInputStream(uri)?.use { stream ->
-                    android.graphics.BitmapFactory.decodeStream(stream)
-                }
-            } catch (_: Exception) { null }
-        } else null
-        val finalArt = newArt ?: uriArt
+        if (meta == null) {
+            artDecodeJob?.cancel()
+            _media.value = null
+            return
+        }
 
-        _media.value = if (meta == null) null else MediaState(
+        val embeddedArt = meta.getBitmap(MediaMetadata.METADATA_KEY_ART)
+            ?: meta.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+        val artUriStr = meta.getString(MediaMetadata.METADATA_KEY_ART_URI)
+            ?: meta.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+
+        val immediateArt = when {
+            embeddedArt != null -> embeddedArt
+            !artUriStr.isNullOrBlank() && artUriStr == cachedArtUri -> cachedArtBitmap
+            else -> null
+        }
+
+        val state = MediaState(
             title = meta.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "",
             artist = meta.getString(MediaMetadata.METADATA_KEY_ARTIST)
                 ?: meta.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST) ?: "",
             album = meta.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: "",
-            albumArt = finalArt,
+            albumArt = immediateArt,
             isPlaying = controller.playbackState?.state == PlaybackState.STATE_PLAYING,
             packageName = controller.packageName ?: "",
             duration = meta.getLong(MediaMetadata.METADATA_KEY_DURATION),
             position = controller.playbackState?.position ?: 0L,
         )
+        _media.value = state
+
+        if (embeddedArt == null && !artUriStr.isNullOrBlank() && artUriStr != cachedArtUri) {
+            artDecodeJob?.cancel()
+            val token = controller.sessionToken
+            artDecodeJob = ioScope.launch {
+                val decoded = try {
+                    val uri = android.net.Uri.parse(artUriStr)
+                    context.contentResolver.openInputStream(uri)?.use { stream ->
+                        android.graphics.BitmapFactory.decodeStream(stream)
+                    }
+                } catch (_: Exception) { null }
+                cachedArtUri = artUriStr
+                cachedArtBitmap = decoded
+                if (decoded != null && activeController?.sessionToken == token) {
+                    val current = _media.value
+                    if (current != null && current.title == state.title) {
+                        _media.value = current.copy(albumArt = decoded)
+                    }
+                }
+            }
+        }
     }
 }

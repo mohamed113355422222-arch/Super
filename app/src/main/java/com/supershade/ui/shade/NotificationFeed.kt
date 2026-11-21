@@ -43,11 +43,18 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.testTag
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.supershade.service.NotificationCollector
 import com.supershade.ui.theme.ChamferedCornerShape
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -697,9 +704,24 @@ fun NotificationFeed(
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val haptics = LocalSuperHaptics.current ?: remember(context) { com.supershade.haptics.SuperHaptics(context) }
-    val isAccessGranted = remember(context) {
-        NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val collectorConnected by NotificationCollector.isConnectedFlow.collectAsState()
+    var hasListenerPkgAccess by remember(context) {
+        mutableStateOf(
+            NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
+        )
     }
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME || event == Lifecycle.Event.ON_START) {
+                hasListenerPkgAccess = NotificationManagerCompat.getEnabledListenerPackages(context)
+                    .contains(context.packageName)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val isAccessGranted = hasListenerPkgAccess || collectorConnected || notifications.isNotEmpty()
     val shadeTheme = LocalShadeTheme.current
 
     var isSearchExpanded by remember { mutableStateOf(false) }
@@ -790,6 +812,7 @@ fun NotificationFeed(
                                 icon = Icons.Default.ClearAll,
                                 label = clearLabel,
                                 isPrimary = true,
+                                modifier = Modifier.testTag("clear_all_notifications_button"),
                                 onClick = {
                                     haptics.sheetDetent()
                                     if (searchQuery.isNotBlank()) {
@@ -900,10 +923,24 @@ fun TogetherNotificationFeed(
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val haptics = LocalSuperHaptics.current ?: remember(context) { com.supershade.haptics.SuperHaptics(context) }
-
-    val isAccessGranted = remember(context) {
-        NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val collectorConnected by NotificationCollector.isConnectedFlow.collectAsState()
+    var hasListenerPkgAccess by remember(context) {
+        mutableStateOf(
+            NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
+        )
     }
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME || event == Lifecycle.Event.ON_START) {
+                hasListenerPkgAccess = NotificationManagerCompat.getEnabledListenerPackages(context)
+                    .contains(context.packageName)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val isAccessGranted = hasListenerPkgAccess || collectorConnected || notifications.isNotEmpty()
 
     var isSearchExpanded by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
@@ -1000,6 +1037,7 @@ fun TogetherNotificationFeed(
                             icon = Icons.Default.ClearAll,
                             label = clearLabel,
                             isPrimary = true,
+                            modifier = Modifier.testTag("clear_all_notifications_button"),
                             onClick = {
                                 haptics.sheetDetent()
                                 if (searchQuery.isNotBlank()) {

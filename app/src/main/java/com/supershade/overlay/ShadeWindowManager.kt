@@ -65,8 +65,10 @@ class ShadeWindowManager(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var hideJob: Job? = null
-    private var isVisible = false
-    private var isInteractiveDragging = false
+    private var blurEnableJob: Job? = null
+    private var transitionGeneration = 0L
+    @Volatile private var isVisible = false
+    @Volatile private var isInteractiveDragging = false
     private var showTimestampMs = 0L
 
     private val baseFlags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -104,12 +106,42 @@ class ShadeWindowManager(
                 .map { it.backdropTheme to it.backdropOpacity }
                 .distinctUntilChanged()
                 .collect { (backdrop, opacity) ->
-                    if (isVisible && !isInteractiveDragging) {
+                    if (isVisible && !isInteractiveDragging && !viewModel.isClosing.value) {
                         if (syncWindowLayoutParams(backdrop, opacity, touchable = true, allowBlur = true)) {
                             applyParamsToAttachedView()
                         }
                     }
                 }
+        }
+        scope.launch {
+            viewModel.isClosing
+                .collect { closing ->
+                    if (closing && isVisible && !isInteractiveDragging) {
+                        beginClosingWindowTransition()
+                    }
+                }
+        }
+    }
+
+    private fun beginClosingWindowTransition() {
+        val gen = ++transitionGeneration
+        blurEnableJob?.cancel()
+        blurEnableJob = null
+        detachStatusBarBlocker()
+        val s = viewModel.state.value
+        if (syncWindowLayoutParams(s.backdropTheme, s.backdropOpacity, touchable = false, allowBlur = false)) {
+            applyParamsToAttachedView()
+        }
+        hideJob?.cancel()
+        hideJob = scope.launch {
+            delay(450L)
+            if (gen == transitionGeneration &&
+                isVisible &&
+                !viewModel.isGestureDragging.value &&
+                viewModel.isClosing.value
+            ) {
+                viewModel.completeClose()
+            }
         }
     }
 
@@ -175,7 +207,9 @@ class ShadeWindowManager(
             setViewTreeViewModelStoreOwner(owner)
             setViewTreeSavedStateRegistryOwner(owner)
             setViewTreeOnBackPressedDispatcherOwner(owner)
-            visibility = View.GONE
+            // Start INVISIBLE + STARTED briefly so Jetpack Compose composes/measures the initial tree
+            // ahead of the first swipe-down gesture, then parks in GONE + CREATED once idle.
+            visibility = View.INVISIBLE
             isFocusable = true
             isFocusableInTouchMode = true
             setOnKeyListener { _, keyCode, event ->
@@ -207,7 +241,14 @@ class ShadeWindowManager(
         overlayView = view
         return try {
             windowManager.addView(view, params)
+            owner.startToStarted()
             view.requestApplyInsets()
+            view.post {
+                if (!isVisible && overlayView === view) {
+                    view.visibility = View.GONE
+                    owner.pauseToCreated()
+                }
+            }
             view
         } catch (e: Exception) {
             android.util.Log.e("ShadeWindowManager", "Failed to add overlay window", e)
@@ -229,12 +270,19 @@ class ShadeWindowManager(
 
     /** Presents the pre-warmed window in passthrough mode so top overlay keeps receiving finger moves. */
     fun beginInteractiveShow(expandQs: Boolean = false) {
+        transitionGeneration += 1L
         hideJob?.cancel()
         hideJob = null
+        blurEnableJob?.cancel()
+        blurEnableJob = null
         isInteractiveDragging = true
         isVisible = true
 
-        val view = ensureAttachedView() ?: return
+        val view = ensureAttachedView() ?: run {
+            isInteractiveDragging = false
+            isVisible = false
+            return
+        }
         val s = viewModel.state.value
         if (syncWindowLayoutParams(s.backdropTheme, s.backdropOpacity, touchable = false, allowBlur = false)) {
             applyParamsToAttachedView()
@@ -248,13 +296,18 @@ class ShadeWindowManager(
 
     /** Finalizes top swipe gesture: either grants touch focus to open shade or leaves passthrough for collapse. */
     fun finishInteractiveShow(shouldOpen: Boolean) {
+        val gen = ++transitionGeneration
         isInteractiveDragging = false
-        val view = overlayView ?: return
+        val view = overlayView ?: run {
+            if (!shouldOpen) viewModel.completeClose()
+            return
+        }
         val s = viewModel.state.value
         if (shouldOpen) {
             showTimestampMs = System.currentTimeMillis()
             isVisible = true
-            if (syncWindowLayoutParams(s.backdropTheme, s.backdropOpacity, touchable = true, allowBlur = true)) {
+            // Make window immediately interactive without forcing a mid-spring blur buffer allocation.
+            if (syncWindowLayoutParams(s.backdropTheme, s.backdropOpacity, touchable = true, allowBlur = false)) {
                 applyParamsToAttachedView()
             }
             if (view.visibility != View.VISIBLE) {
@@ -264,7 +317,19 @@ class ShadeWindowManager(
             view.requestFocus()
             attachStatusBarBlocker()
             scope.launch { governor?.collapse() }
+            blurEnableJob?.cancel()
+            blurEnableJob = scope.launch {
+                delay(200L)
+                if (gen == transitionGeneration && isVisible && !isInteractiveDragging) {
+                    val cur = viewModel.state.value
+                    if (syncWindowLayoutParams(cur.backdropTheme, cur.backdropOpacity, touchable = true, allowBlur = true)) {
+                        applyParamsToAttachedView()
+                    }
+                }
+            }
         } else {
+            blurEnableJob?.cancel()
+            blurEnableJob = null
             detachStatusBarBlocker()
             if (syncWindowLayoutParams(s.backdropTheme, s.backdropOpacity, touchable = false, allowBlur = false)) {
                 applyParamsToAttachedView()
@@ -272,8 +337,8 @@ class ShadeWindowManager(
             // Safety fallback in case collapse animation didn't emit completion.
             hideJob?.cancel()
             hideJob = scope.launch {
-                delay(400L)
-                if (!viewModel.isGestureDragging.value && isVisible) {
+                delay(420L)
+                if (gen == transitionGeneration && !viewModel.isGestureDragging.value && isVisible) {
                     viewModel.completeClose()
                 }
             }
@@ -283,9 +348,12 @@ class ShadeWindowManager(
     /** Presents the shade overlay (used for quick-open buttons, broadcasts, accessibility actions). */
     fun show(expandQs: Boolean = false) {
         if (isInteractiveDragging || viewModel.isGestureDragging.value) return
+        transitionGeneration += 1L
         showTimestampMs = System.currentTimeMillis()
         hideJob?.cancel()
         hideJob = null
+        blurEnableJob?.cancel()
+        blurEnableJob = null
 
         val view = ensureAttachedView() ?: return
         isVisible = true
@@ -309,8 +377,16 @@ class ShadeWindowManager(
 
     /** Requests an animated dismissal and makes background immediately touchable. */
     fun hide() {
-        if (!isVisible) return
+        if (!isVisible) {
+            if (viewModel.state.value.isOpen) {
+                viewModel.completeClose()
+            }
+            return
+        }
+        val gen = ++transitionGeneration
         isInteractiveDragging = false
+        blurEnableJob?.cancel()
+        blurEnableJob = null
         detachStatusBarBlocker()
         val s = viewModel.state.value
         if (syncWindowLayoutParams(s.backdropTheme, s.backdropOpacity, touchable = false, allowBlur = false)) {
@@ -320,8 +396,8 @@ class ShadeWindowManager(
             viewModel.requestAnimatedClose()
             hideJob?.cancel()
             hideJob = scope.launch {
-                delay(380L)
-                if (isVisible) {
+                delay(400L)
+                if (gen == transitionGeneration && isVisible && !viewModel.isGestureDragging.value) {
                     viewModel.completeClose()
                 }
             }
@@ -332,8 +408,11 @@ class ShadeWindowManager(
 
     /** Hides the pre-warmed window immediately while keeping Compose alive for instant next open. */
     fun hideImmediate() {
+        transitionGeneration += 1L
         hideJob?.cancel()
         hideJob = null
+        blurEnableJob?.cancel()
+        blurEnableJob = null
         isInteractiveDragging = false
         isVisible = false
         detachStatusBarBlocker()
@@ -452,6 +531,14 @@ private class ShadeLifecycleOwner :
     fun create() {
         savedStateRegistryController.performRestore(null)
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
+    }
+
+    fun startToStarted() {
+        if (lifecycleRegistry.currentState != Lifecycle.State.STARTED &&
+            lifecycleRegistry.currentState != Lifecycle.State.RESUMED
+        ) {
+            lifecycleRegistry.currentState = Lifecycle.State.STARTED
+        }
     }
 
     fun resume() {
