@@ -90,7 +90,7 @@ class ShadeGestureInteractionTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val vm = createViewModel(context)
         val events = mutableListOf<ShadeTransitionEvent>()
-        val job = launch(Dispatchers.Main) {
+        val job = launch(Dispatchers.Unconfined) {
             vm.transitionEvent.collect { events.add(it) }
         }
         try {
@@ -144,6 +144,7 @@ class ShadeGestureInteractionTest {
             assertEquals(null, vm.latestTransition.value)
         } finally {
             job.cancel()
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
         }
     }
 

@@ -94,7 +94,7 @@ class CustomStatusBarSettingsUiTest {
         assertFalse(config.showClockSeconds)
         assertEquals(ClockFormat.SYSTEM, config.clockFormat)
         assertEquals(BatteryPercentMode.BESIDE, config.batteryPercentMode)
-        composeRule.onNodeWithTag("csb_master_toggle").assertIsDisplayed()
+        composeRule.onNodeWithTag("csb_master_toggle").performScrollTo().assertIsDisplayed()
     }
 
     @Test
@@ -132,8 +132,8 @@ class CustomStatusBarSettingsUiTest {
         composeRule.waitForIdle()
 
         assertTrue(config.showNotificationIcons)
-        composeRule.onNodeWithText("Max Notification Icons").assertIsDisplayed()
-        composeRule.onNodeWithText("Allow").assertIsDisplayed()
+        composeRule.onNodeWithText("Max Notification Icons").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Allow").performScrollTo().assertIsDisplayed()
 
         // Change max icon cap to 5 and enable silent notifications
         composeRule.onNodeWithText("5").performScrollTo().performClick()

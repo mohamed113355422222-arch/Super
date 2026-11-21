@@ -246,13 +246,23 @@ class NotificationDismissalTest {
         repo.onNotificationPosted(sbn)
         assertEquals(listOf(ongoing.key), repo.notifications.value.map { it.key })
 
-        // Clear all clears single-item undo banner
+        // Clear all clears single-item undo banner even when only ongoing remains
         val extra = makeSbn(context, "com.msg.app", 44, "Another", "Item")
         repo.onNotificationPosted(extra)
         repo.cancelAndRemove(extra.key)
         assertTrue(repo.lastDismissed.value != null)
         repo.cancelAll()
         assertEquals(null, repo.lastDismissed.value)
+
+        // Clear all also removes clearable notifications while preserving ongoing ones and tombstoning cleared items
+        val extra2 = makeSbn(context, "com.msg.app", 45, "Second", "Clearable")
+        repo.onNotificationPosted(extra2)
+        assertEquals(2, repo.notifications.value.size)
+        repo.cancelAll()
+        assertEquals(listOf(ongoing.key), repo.notifications.value.map { it.key })
+        assertEquals(null, repo.lastDismissed.value)
+        repo.syncActiveNotifications(listOf(extra2, ongoing))
+        assertEquals(listOf(ongoing.key), repo.notifications.value.map { it.key })
     }
 
     @Test

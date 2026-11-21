@@ -83,7 +83,7 @@ class StatusBarVerificationTest {
         repo.startListening()
 
         val collected = mutableListOf<CustomStatusBarState>()
-        val collectJob = launch(Dispatchers.Main) {
+        val collectJob = launch(Dispatchers.Unconfined) {
             repo.statusBarState.collect { collected.add(it) }
         }
 
@@ -124,6 +124,7 @@ class StatusBarVerificationTest {
             assertFalse(vibrateState.isSilent)
         } finally {
             collectJob.cancel()
+            shadowOf(android.os.Looper.getMainLooper()).idle()
             repo.stopListening()
         }
     }

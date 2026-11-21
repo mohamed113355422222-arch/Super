@@ -484,6 +484,7 @@ class NotificationRepository(
     }
 
     fun cancelAll() {
+        _lastDismissed.value = null
         val now = System.currentTimeMillis()
         val pinned = _pinnedKeys.value
         // Pinned and ongoing notifications are immune to Clear all
@@ -493,7 +494,6 @@ class NotificationRepository(
         val dismissibleKeys = dismissible.map { it.key }
         val dismissibleKeySet = dismissibleKeys.toSet()
         dismissibleKeys.forEach { recentUndoKeys.remove(it) }
-        _lastDismissed.value = null
         val tombstoneExpiry = now + DISMISS_TOMBSTONE_TTL_MS
 
         val newRecords = dismissible
